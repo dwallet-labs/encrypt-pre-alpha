@@ -1,0 +1,5 @@
+error: select needs 2 args
+ --> tests/compile_fail/select_wrong_arity.rs:8:18
+  |
+8 |     let x = flag.select(&a);
+  |                  ^^^^^^

@@ -1,0 +1,37 @@
+[package]
+name = "encrypt-solana-test"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Internal
+encrypt-types = { workspace = true }
+encrypt-compute = { workspace = true }
+encrypt-service = { workspace = true }
+encrypt-dev = { workspace = true }
+
+# LiteSVM
+litesvm = { workspace = true }
+
+# solana-program-test
+solana-program-test = { workspace = true }
+tokio = { workspace = true }
+
+# Mollusk
+mollusk-svm = { workspace = true }
+
+# Solana
+solana-sdk = { workspace = true }
+solana-account = { workspace = true }
+solana-address = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-instruction = { workspace = true }
+solana-transaction = { workspace = true }
+solana-system-interface = { workspace = true }
+bincode = { workspace = true }
+
+[dev-dependencies]
+encrypt-dsl = { workspace = true }

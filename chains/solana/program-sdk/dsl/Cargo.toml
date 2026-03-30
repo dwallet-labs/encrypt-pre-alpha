@@ -1,0 +1,16 @@
+[package]
+name = "encrypt-solana-dsl"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+encrypt-types = { workspace = true }
+encrypt-solana-types = { workspace = true }
+encrypt-dsl = { workspace = true }
+encrypt-solana-dsl-macros = { workspace = true }
+
+[dev-dependencies]
+trybuild = { workspace = true }

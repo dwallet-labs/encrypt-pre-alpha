@@ -1,0 +1,100 @@
+// Copyright (c) dWallet Labs, Ltd.
+// SPDX-License-Identifier: BSD-3-Clause-Clear
+
+syntax = "proto3";
+
+package encrypt.v1;
+
+// Chain identifier.
+enum Chain {
+  SOLANA = 0;
+}
+
+// Client-facing gRPC API for the Encrypt executor.
+//
+// Same API across all chains and environments (local dev, devnet, testnet, mainnet).
+service EncryptService {
+  // Submit one or more encrypted input ciphertexts.
+  //
+  // A single ZK proof covers all inputs in the batch. All inputs share
+  // the same authorized party and network encryption key. The executor
+  // validates the proof (mock in dev mode), creates each ciphertext on-chain,
+  // and returns their identifiers ready for immediate use.
+  rpc CreateInput(CreateInputRequest) returns (CreateInputResponse);
+
+  // Read a ciphertext off-chain.
+  //
+  // The request contains a BCS-serialized ReadCiphertextMessage signed by
+  // the authorized party (or anyone if the ciphertext is public).
+  //
+  // In production: returns the ciphertext re-encrypted under the user's
+  // re-encryption key (the user decrypts locally with their private key).
+  // In mock mode: returns the plaintext value directly.
+  //
+  // Responses are cached per (ciphertext_identifier, signer, epoch).
+  // When the epoch advances, the cache is invalidated and old signatures
+  // are rejected.
+  rpc ReadCiphertext(ReadCiphertextRequest) returns (ReadCiphertextResponse);
+}
+
+// ── CreateInput ──
+
+// A single encrypted input value.
+message EncryptedInput {
+  // FHE ciphertext bytes (encrypted under the request's network_encryption_public_key).
+  bytes ciphertext_bytes = 1;
+
+  // FHE type discriminator (0-44). Validated server-side.
+  uint32 fhe_type = 2;
+}
+
+message CreateInputRequest {
+  // Target chain where the ciphertexts should be created.
+  Chain chain = 1;
+
+  // One or more encrypted input values to create on-chain.
+  repeated EncryptedInput inputs = 2;
+
+  // ZK proof of valid encryption covering all inputs (skipped in dev mode).
+  bytes proof = 3;
+
+  // Who can use these ciphertexts (program/contract address or user address).
+  // Shared across all inputs in this batch.
+  bytes authorized = 4;
+
+  // Network encryption public key all inputs were encrypted under.
+  // 32 bytes. Must match an active key registered on-chain.
+  bytes network_encryption_public_key = 5;
+}
+
+message CreateInputResponse {
+  // On-chain ciphertext identifiers, one per input (same order as request).
+  repeated bytes ciphertext_identifiers = 1;
+}
+
+// ── ReadCiphertext ──
+
+message ReadCiphertextRequest {
+  // BCS-serialized ReadCiphertextMessage (the signed payload).
+  bytes message = 1;
+
+  // Ed25519 signature over `message` by the authorized party.
+  bytes signature = 2;
+
+  // Public key of the signer (32 bytes).
+  // Must match the ciphertext's `authorized` field, or the ciphertext must be public.
+  bytes signer = 3;
+}
+
+message ReadCiphertextResponse {
+  // Production: ciphertext re-encrypted under the user's re-encryption key.
+  //             The user decrypts locally with their private key.
+  // Mock: raw plaintext bytes (fhe_type determines interpretation).
+  bytes value = 1;
+
+  // FHE type of the ciphertext.
+  uint32 fhe_type = 2;
+
+  // On-chain digest (for client-side verification).
+  bytes digest = 3;
+}

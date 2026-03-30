@@ -1,0 +1,16 @@
+[package]
+name = "encrypt-service"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+sqlite = ["rusqlite"]
+
+[dependencies]
+encrypt-types = { workspace = true }
+encrypt-compute = { workspace = true }
+rusqlite = { version = "0.34", features = ["bundled"], optional = true }

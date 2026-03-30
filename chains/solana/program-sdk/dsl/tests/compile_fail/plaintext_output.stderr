@@ -1,0 +1,5 @@
+error: encrypt_fn_graph outputs must be encrypted types, not plaintext (`PUint64`)
+ --> tests/compile_fail/plaintext_output.rs:8:35
+  |
+8 | fn bad(a: EUint64, b: PUint64) -> PUint64 {
+  |                                   ^^^^^^^

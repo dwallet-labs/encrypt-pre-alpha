@@ -1,0 +1,31 @@
+[package]
+name = "confidential-counter"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+encrypt-types = { workspace = true }
+encrypt-dsl = { package = "encrypt-solana-dsl", path = "../../../program-sdk/dsl" }
+encrypt-pinocchio = { workspace = true }
+pinocchio = { workspace = true }
+pinocchio-system = { workspace = true }
+
+[dev-dependencies]
+encrypt-solana-test = { workspace = true }
+encrypt-types = { workspace = true }
+encrypt-dsl = { package = "encrypt-solana-dsl", path = "../../../program-sdk/dsl" }
+solana-sdk = { workspace = true }
+mollusk-svm = { workspace = true }
+solana-account = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-instruction = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+mock = []

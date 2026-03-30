@@ -1,0 +1,5 @@
+error: unsupported FHE method `foobar`
+ --> tests/compile_fail/unsupported_method.rs:8:15
+  |
+8 |     let x = a.foobar(&b);
+  |               ^^^^^^

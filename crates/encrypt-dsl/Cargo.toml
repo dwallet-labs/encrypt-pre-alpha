@@ -1,0 +1,11 @@
+[package]
+name = "encrypt-dsl"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+encrypt-types = { workspace = true }
+encrypt-dsl-macros = { workspace = true }

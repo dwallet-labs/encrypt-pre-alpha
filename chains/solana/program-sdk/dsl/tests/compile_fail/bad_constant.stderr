@@ -1,0 +1,5 @@
+error: unknown FHE type: EUint999
+ --> tests/compile_fail/bad_constant.rs:8:13
+  |
+8 |     let c = EUint999::from(42u32);
+  |             ^^^^^^^^^^^^^^

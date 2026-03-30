@@ -1,0 +1,17 @@
+[package]
+name = "encrypt-grpc"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+description = "Chain-agnostic gRPC client and server types for the Encrypt executor"
+
+[dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+prost-build = "0.14"

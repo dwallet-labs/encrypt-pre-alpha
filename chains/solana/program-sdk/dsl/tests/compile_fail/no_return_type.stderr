@@ -1,0 +1,7 @@
+error: encrypt_fn_graph must have a return type
+ --> tests/compile_fail/no_return_type.rs:7:1
+  |
+7 | #[encrypt_fn_graph]
+  | ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `encrypt_fn_graph` (in Nightly builds, run with -Z macro-backtrace for more info)

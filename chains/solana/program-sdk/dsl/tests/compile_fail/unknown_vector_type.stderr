@@ -1,0 +1,5 @@
+error: unknown FHE type: EUint32VectorBad
+ --> tests/compile_fail/unknown_vector_type.rs:8:11
+  |
+8 | fn bad(a: EUint32VectorBad) -> EUint32VectorBad {
+  |           ^^^^^^^^^^^^^^^^

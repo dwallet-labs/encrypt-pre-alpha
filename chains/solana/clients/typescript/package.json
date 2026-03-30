@@ -1,0 +1,35 @@
+{
+  "name": "@encrypt.xyz/pre-alpha-solana-client",
+  "version": "0.1.0",
+  "description": "TypeScript client for the Encrypt (pre-alpha) FHE program on Solana",
+  "license": "BSD-3-Clause-Clear",
+  "type": "module",
+  "module": "src/generated/index.js",
+  "exports": {
+    ".": "./src/generated/index.js",
+    "./grpc": "./src/grpc.ts",
+    "./grpc-web": "./src/grpc-web.ts"
+  },
+  "scripts": {
+    "generate": "protoc --plugin=./node_modules/.bin/protoc-gen-ts --ts_out=src/generated/grpc-web --proto_path=../../../../proto ../../../../proto/encrypt_service.proto && protoc --plugin=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=src/generated/grpc --ts_proto_opt=outputServices=grpc-js,esModuleInterop=true --proto_path=../../../../proto ../../../../proto/encrypt_service.proto",
+    "build": "bunx --bun tsc",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.11",
+    "@grpc/grpc-js": "^1.12",
+    "@protobuf-ts/grpcweb-transport": "^2.11",
+    "@protobuf-ts/runtime": "^2.11",
+    "@protobuf-ts/runtime-rpc": "^2.11"
+  },
+  "devDependencies": {
+    "@protobuf-ts/plugin": "^2.11.1",
+    "@types/bun": "latest",
+    "ts-proto": "^2.11.6"
+  },
+  "peerDependencies": {
+    "@solana/kit": "^6.4",
+    "@solana/program-client-core": "^6.4",
+    "typescript": "^5"
+  }
+}

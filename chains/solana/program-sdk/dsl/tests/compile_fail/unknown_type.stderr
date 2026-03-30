@@ -1,0 +1,5 @@
+error: unknown FHE type: EUint999
+ --> tests/compile_fail/unknown_type.rs:7:11
+  |
+7 | fn bad(a: EUint999) -> EUint999 {
+  |           ^^^^^^^^

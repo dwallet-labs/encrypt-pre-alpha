@@ -1,0 +1,5 @@
+error: unknown: b
+ --> tests/compile_fail/unknown_variable.rs:8:17
+  |
+8 |     let x = a + b;
+  |                 ^

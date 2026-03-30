@@ -1,0 +1,23 @@
+[package]
+name = "e2e-voting-rust"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "BSD-3-Clause-Clear"
+
+[[bin]]
+name = "e2e-voting"
+path = "src/main.rs"
+
+[workspace]
+
+[dependencies]
+encrypt-types = { path = "../../../../../../crates/encrypt-types" }
+encrypt-solana-client = { path = "../../../../clients/rust" }
+solana-sdk = "4"
+solana-rpc-client = "4.0.0-beta.3"
+solana-commitment-config = "3"
+solana-transaction = "3"
+bincode = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

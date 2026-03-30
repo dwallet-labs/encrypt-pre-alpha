@@ -1,0 +1,12 @@
+[package]
+name = "encrypt-pinocchio"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+edition.workspace = true
+
+[dependencies]
+encrypt-types = { workspace = true }
+encrypt-solana-types = { workspace = true }
+pinocchio = { workspace = true }

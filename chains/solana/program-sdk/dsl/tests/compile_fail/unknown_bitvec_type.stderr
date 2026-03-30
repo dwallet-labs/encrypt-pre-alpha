@@ -1,0 +1,5 @@
+error: unknown FHE type: E3BitVector
+ --> tests/compile_fail/unknown_bitvec_type.rs:8:11
+  |
+8 | fn bad(a: E3BitVector) -> E3BitVector {
+  |           ^^^^^^^^^^^

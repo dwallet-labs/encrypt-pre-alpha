@@ -1,0 +1,5 @@
+error: else required
+ --> tests/compile_fail/missing_else.rs:8:13
+  |
+8 |     let x = if flag { a };
+  |             ^^^^^^^^^^^^^

@@ -1,0 +1,87 @@
+# IDE
+**/.history/
+**/.vscode/
+**/.idea/
+
+# OSX
+.DS_Store
+
+# Rust build directory
+**/target
+.pre-commit*
+
+# Move build directory
+build
+storage
+
+# Move package summary
+package_summaries
+
+# codegen generated
+**/generated/
+
+# Move-related files
+Move.lock
+.trace
+.coverage_map.mvcov
+Pub.localnet.toml
+
+# Thumbnails
+._*
+
+# Emacs
+\#*\#
+.\#*
+
+# Python
+.pyc
+
+# Node.js
+node_modules
+.tsbuildinfo
+*.tsbuildinfo
+.turbo
+
+# App build directories
+dist/
+storybook-static/
+web-ext-artifacts/
+.next/
+next-env.d.ts
+
+# App test artifacts
+coverage/
+test-results/
+playwright-report/
+playwright/.cache/
+
+# logs
+wallet.log.*
+encrypt.log.*
+.vercel
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# misc
+*.key
+.env
+
+lcov.info
+*.log
+*.seed
+
+# AI
+.cursor
+
+# TypeDoc
+sdk/typescript/docs
+move_pkg_lock_root.lock
+node-compile-cachetest-ledger/
+.encrypt-dev/
+
+# Solana
+test-ledger
+
+# Deploy keypairs
+keys/
