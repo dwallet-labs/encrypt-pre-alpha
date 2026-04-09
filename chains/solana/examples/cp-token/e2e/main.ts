@@ -1,54 +1,46 @@
 #!/usr/bin/env bun
 /**
- * CP-Token E2E Demo — Confidential Performant Token on Solana Devnet
+ * CP-Token E2E Demo — USDC → cpUSDC → USDC on Solana Devnet
  *
- * Full lifecycle: create mint → create accounts → mint (encrypted) →
- * transfer (encrypted) → decrypt → reveal → verify balances
- *
- * All amounts are client-encrypted via gRPC — plaintext never touches
- * the chain. Balances are always encrypted.
+ *   1. Create mock USDC + mint 10 USDC to Alice
+ *   2. Create cpUSDC mint + vault + token accounts
+ *   3. Alice wraps 10 USDC → 10 cpUSDC
+ *   4. Alice sends 5 cpUSDC to Bob (encrypted)
+ *   5. Bob unwraps 5 cpUSDC → 5 USDC
+ *   6. Alice sends 3 cpUSDC to Mark (encrypted)
+ *   7. Mark unwraps 2 cpUSDC → 2 USDC
+ *   8. Alice unwraps 1 cpUSDC → 1 USDC
+ *   9. Alice still has 1 cpUSDC
  *
  * Usage: bun main.ts <ENCRYPT_PROGRAM_ID> <CP_TOKEN_PROGRAM_ID>
  */
 
 import {
-  Connection,
-  Keypair,
-  PublicKey,
+  Connection, Keypair, PublicKey, SystemProgram, Transaction,
+  TransactionInstruction, sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import * as fs from "fs";
 
+import { type EncryptAccounts } from "../../_shared/encrypt-setup.ts";
 import {
-  setupEncrypt,
-  encryptCpiAccounts,
-  type EncryptAccounts,
-} from "../../_shared/encrypt-setup.ts";
-import {
-  log,
-  ok,
-  val,
-  sendTx,
-  pda,
-  pollUntil,
-  isVerified,
-  isDecrypted,
-  mockCiphertext,
+  log, ok, val, sendTx, pda, pollUntil, isVerified, isDecrypted, mockCiphertext,
 } from "../../_shared/helpers.ts";
 import { createEncryptClient, Chain } from "../../../clients/typescript/src/grpc.ts";
 import {
-  deriveCpTokenPdas,
-  deriveMintPda,
-  deriveAccountPda,
-  initializeMintIx,
-  initializeAccountIx,
-  mintToIx,
-  transferIx,
-  requestDecryptIx,
-  revealBalanceIx,
+  type CpTokenContext, deriveCpTokenPdas, deriveMintPda, deriveAccountPda,
+  deriveVaultPda, initializeMintIx, initializeAccountIx, initializeVaultIx,
+  transferIx, wrapIx, unwrapIx, requestDecryptIx, revealBalanceIx,
 } from "./instructions.ts";
+import {
+  TOKEN_PROGRAM_ID, createSplMint, createSplTokenAccount,
+  splMintToIx, readSplBalance,
+} from "./spl-helpers.ts";
 
 const RPC_URL = "https://api.devnet.solana.com";
 const FHE_UINT64 = 4;
+const DECIMALS = 6;
+const USDC = (n: number) => BigInt(n) * 1_000_000n;
+const REVEALED_OFFSET = 233; // TokenAccount.revealed_balance offset
 
 const [encryptArg, cpTokenArg] = process.argv.slice(2);
 if (!encryptArg || !cpTokenArg) {
@@ -60,267 +52,259 @@ const ENCRYPT_PROGRAM = new PublicKey(encryptArg);
 const CP_TOKEN_PROGRAM = new PublicKey(cpTokenArg);
 const connection = new Connection(RPC_URL, "confirmed");
 
-// Load local keypair (solana config keypair) or generate one
 const KEYPAIR_PATH = process.env.KEYPAIR_PATH ?? `${process.env.HOME}/.config/solana/devnet-admin.json`;
 const payer = (() => {
   try {
-    const raw = JSON.parse(fs.readFileSync(KEYPAIR_PATH, "utf-8"));
-    return Keypair.fromSecretKey(Uint8Array.from(raw));
-  } catch {
-    return Keypair.generate();
-  }
+    return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(KEYPAIR_PATH, "utf-8"))));
+  } catch { return Keypair.generate(); }
 })();
 
+// ── Helpers ──
+
+async function createEncryptedAmount(
+  grpc: ReturnType<typeof createEncryptClient>,
+  amount: bigint, networkKey: Buffer
+): Promise<PublicKey> {
+  const { ciphertextIdentifiers } = await grpc.createInput({
+    chain: Chain.Solana,
+    inputs: [{ ciphertextBytes: mockCiphertext(amount), fheType: FHE_UINT64 }],
+    authorized: CP_TOKEN_PROGRAM.toBytes(),
+    networkEncryptionPublicKey: networkKey,
+  });
+  return new PublicKey(ciphertextIdentifiers[0]);
+}
+
+/** Decrypt + reveal + unwrap. Full exit from confidential domain. */
+async function doUnwrap(
+  grpc: ReturnType<typeof createEncryptClient>,
+  ctx: CpTokenContext,
+  cpMint: PublicKey, vault: PublicKey, vaultAta: PublicKey,
+  tokenAccount: PublicKey, balanceCt: PublicKey, userAta: PublicKey,
+  owner: Keypair, amount: bigint, label: string,
+) {
+  // 1. Request decryption
+  log(label, "Decrypting balance...");
+  const decReq = Keypair.generate();
+  await sendTx(connection, payer, [
+    requestDecryptIx(ctx, tokenAccount, decReq.publicKey, balanceCt, owner.publicKey),
+  ], [owner, decReq]);
+
+  await pollUntil(connection, decReq.publicKey, isDecrypted, 120_000);
+
+  // Debug: read raw decrypted value from request account
+
+  ok("Balance decrypted");
+
+  // 2. Reveal balance on-chain
+  await sendTx(connection, payer, [
+    revealBalanceIx(CP_TOKEN_PROGRAM, tokenAccount, decReq.publicKey, owner.publicKey),
+  ], [owner]);
+
+  const taData = (await connection.getAccountInfo(tokenAccount))!.data as Buffer;
+  const revealed = taData.readBigUInt64LE(REVEALED_OFFSET);
+  val("  Revealed balance", `${Number(revealed) / 1e6} cpUSDC`);
+
+  // 3. Unwrap (burn + SPL transfer in one step)
+  log(label, `Unwrapping ${Number(amount) / 1e6} cpUSDC → USDC...`);
+  const amountCt = await createEncryptedAmount(grpc, amount, ctx.enc.networkKey);
+  await sendTx(connection, payer, [
+    unwrapIx(ctx, vault, cpMint, tokenAccount, vaultAta, userAta,
+      balanceCt, amountCt, owner.publicKey, amount),
+  ], [owner]);
+
+  await pollUntil(connection, balanceCt, isVerified, 120_000);
+  ok("Unwrap complete — USDC released from vault");
+}
+
+// ── Main ──
+
 async function main() {
-  console.log("\n\x1b[1m═══ CP-Token E2E Demo ═══\x1b[0m\n");
-  console.log("  Confidential token: all balances and amounts are encrypted\n");
+  console.log("\n\x1b[1m═══ CP-Token E2E: USDC → cpUSDC → USDC ═══\x1b[0m\n");
 
-  // ── Setup ──
-  // Setup encrypt accounts (inline — avoids setupEncrypt's 100 SOL airdrop
-  // which fails on devnet rate limits when using a pre-funded keypair)
   const grpc = createEncryptClient();
-  log("Setup", `Connected to executor gRPC`);
   log("Setup", `Payer: ${payer.publicKey.toBase58()}`);
-
   const bal = await connection.getBalance(payer.publicKey);
   ok(`Balance: ${bal / 1e9} SOL`);
-  if (bal < 1e9) {
-    log("Setup", "Airdropping SOL...");
-    const sig = await connection.requestAirdrop(payer.publicKey, 2e9);
-    await connection.confirmTransaction(sig);
-  }
 
+  // Encrypt setup
   const [configPda] = pda([Buffer.from("encrypt_config")], ENCRYPT_PROGRAM);
   const [eventAuthority] = pda([Buffer.from("__event_authority")], ENCRYPT_PROGRAM);
   const [depositPda, depositBump] = pda(
-    [Buffer.from("encrypt_deposit"), payer.publicKey.toBuffer()],
-    ENCRYPT_PROGRAM
-  );
+    [Buffer.from("encrypt_deposit"), payer.publicKey.toBuffer()], ENCRYPT_PROGRAM);
   const networkKey = Buffer.alloc(32, 0x55);
-  const [networkKeyPda] = pda(
-    [Buffer.from("network_encryption_key"), networkKey],
-    ENCRYPT_PROGRAM
-  );
+  const [networkKeyPda] = pda([Buffer.from("network_encryption_key"), networkKey], ENCRYPT_PROGRAM);
 
-  // Create deposit if needed
   const depositInfo = await connection.getAccountInfo(depositPda);
   if (!depositInfo) {
-    log("Setup", "Creating deposit...");
+    log("Setup", "Creating Encrypt deposit...");
     const configInfo = await connection.getAccountInfo(configPda);
     if (!configInfo) throw new Error("Encrypt config not initialized");
     const encVault = new PublicKey((configInfo.data as Buffer).subarray(100, 132));
     const vaultPk = encVault.equals(PublicKey.default) ? payer.publicKey : encVault;
-
-    const depositData = Buffer.alloc(18);
-    depositData[0] = 14;
-    depositData[1] = depositBump;
-
-    await sendTx(connection, payer, [
-      new (await import("@solana/web3.js")).TransactionInstruction({
-        programId: ENCRYPT_PROGRAM,
-        data: depositData,
-        keys: [
-          { pubkey: depositPda, isSigner: false, isWritable: true },
-          { pubkey: configPda, isSigner: false, isWritable: false },
-          { pubkey: payer.publicKey, isSigner: true, isWritable: false },
-          { pubkey: payer.publicKey, isSigner: true, isWritable: true },
-          { pubkey: payer.publicKey, isSigner: true, isWritable: true },
-          { pubkey: vaultPk, isSigner: vaultPk.equals(payer.publicKey), isWritable: true },
-          { pubkey: PublicKey.default, isSigner: false, isWritable: false },
-          { pubkey: PublicKey.default, isSigner: false, isWritable: false },
-        ],
-      }),
-    ]);
+    const dd = Buffer.alloc(18); dd[0] = 14; dd[1] = depositBump;
+    await sendTx(connection, payer, [new TransactionInstruction({
+      programId: ENCRYPT_PROGRAM, data: dd,
+      keys: [
+        { pubkey: depositPda, isSigner: false, isWritable: true },
+        { pubkey: configPda, isSigner: false, isWritable: false },
+        { pubkey: payer.publicKey, isSigner: true, isWritable: false },
+        { pubkey: payer.publicKey, isSigner: true, isWritable: true },
+        { pubkey: payer.publicKey, isSigner: true, isWritable: true },
+        { pubkey: vaultPk, isSigner: vaultPk.equals(payer.publicKey), isWritable: true },
+        { pubkey: PublicKey.default, isSigner: false, isWritable: false },
+        { pubkey: PublicKey.default, isSigner: false, isWritable: false },
+      ],
+    })]);
     ok("Deposit created");
-  } else {
-    ok("Deposit already exists");
-  }
+  } else { ok("Deposit exists"); }
 
   const enc: EncryptAccounts = {
-    encryptProgram: ENCRYPT_PROGRAM,
-    configPda,
-    eventAuthority,
-    depositPda,
-    networkKeyPda,
-    networkKey,
+    encryptProgram: ENCRYPT_PROGRAM, configPda, eventAuthority,
+    depositPda, networkKeyPda, networkKey,
   };
   const { cpiAuthority, cpiBump } = deriveCpTokenPdas(CP_TOKEN_PROGRAM, payer.publicKey);
-
-  const ctx = {
-    programId: CP_TOKEN_PROGRAM,
-    enc,
-    payer: payer.publicKey,
-    cpiAuthority,
-    cpiBump,
+  const ctx: CpTokenContext = {
+    programId: CP_TOKEN_PROGRAM, enc, payer: payer.publicKey, cpiAuthority, cpiBump,
   };
 
-  // ── 1. Create Mint ──
-  log("1/8", "Creating confidential token mint (6 decimals)...");
-  const mintAuthority = Keypair.generate();
-  const [mintPda, mintBump] = deriveMintPda(CP_TOKEN_PROGRAM, mintAuthority.publicKey);
-
-  await sendTx(connection, payer, [
-    initializeMintIx(ctx, mintPda, mintBump, 6, mintAuthority.publicKey),
-  ], [mintAuthority]);
-  ok(`Mint: ${mintPda.toBase58()}`);
-
-  // ── 2. Create Token Accounts ──
-  log("2/8", "Creating token accounts for Alice and Bob...");
-
+  // Fund users
   const alice = Keypair.generate();
   const bob = Keypair.generate();
+  const mark = Keypair.generate();
+  await sendAndConfirmTransaction(connection, new Transaction().add(
+    SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: alice.publicKey, lamports: 0.1e9 }),
+    SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: bob.publicKey, lamports: 0.1e9 }),
+    SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: mark.publicKey, lamports: 0.1e9 }),
+  ), [payer]);
 
-  const [aliceAccount, aliceBump] = deriveAccountPda(CP_TOKEN_PROGRAM, mintPda, alice.publicKey);
-  const [bobAccount, bobBump] = deriveAccountPda(CP_TOKEN_PROGRAM, mintPda, bob.publicKey);
+  // ═══════════════════════════════════════════
+  // 1. Create mock USDC + mint 10 to Alice
+  // ═══════════════════════════════════════════
+  log("1/9", "Creating mock USDC...");
+  const usdcMint = await createSplMint(connection, payer, DECIMALS, payer.publicKey);
+  ok(`USDC Mint: ${usdcMint.publicKey.toBase58()}`);
 
-  const aliceBalanceCt = Keypair.generate();
-  const bobBalanceCt = Keypair.generate();
+  const aliceAta = await createSplTokenAccount(connection, payer, usdcMint.publicKey, alice.publicKey);
+  const bobAta = await createSplTokenAccount(connection, payer, usdcMint.publicKey, bob.publicKey);
+  const markAta = await createSplTokenAccount(connection, payer, usdcMint.publicKey, mark.publicKey);
+
+  await sendTx(connection, payer, [splMintToIx(usdcMint.publicKey, aliceAta.publicKey, payer.publicKey, USDC(10))]);
+  val("Alice USDC", "10");
+
+  // ═══════════════════════════════════════════
+  // 2. Create cpUSDC mint + vault + accounts
+  // ═══════════════════════════════════════════
+  log("2/9", "Creating cpUSDC mint, vault, accounts...");
+  const mintAuth = Keypair.generate();
+  const [cpMint, cpMintBump] = deriveMintPda(CP_TOKEN_PROGRAM, mintAuth.publicKey);
+  await sendTx(connection, payer, [initializeMintIx(ctx, cpMint, cpMintBump, DECIMALS, mintAuth.publicKey)], [mintAuth]);
+  ok(`cpUSDC Mint: ${cpMint.toBase58()}`);
+
+  const [vaultPda, vaultBump] = deriveVaultPda(CP_TOKEN_PROGRAM, cpMint);
+  await sendTx(connection, payer, [initializeVaultIx(ctx, vaultPda, vaultBump, cpMint, usdcMint.publicKey)]);
+  const vaultAta = await createSplTokenAccount(connection, payer, usdcMint.publicKey, vaultPda);
+  ok(`Vault: ${vaultPda.toBase58()}`);
+
+  const [aliceCp, aliceBump] = deriveAccountPda(CP_TOKEN_PROGRAM, cpMint, alice.publicKey);
+  const aliceBal = Keypair.generate();
+  await sendTx(connection, payer, [initializeAccountIx(ctx, aliceCp, aliceBump, cpMint, alice.publicKey, aliceBal.publicKey)], [aliceBal]);
+
+  const [bobCp, bobBump] = deriveAccountPda(CP_TOKEN_PROGRAM, cpMint, bob.publicKey);
+  const bobBal = Keypair.generate();
+  await sendTx(connection, payer, [initializeAccountIx(ctx, bobCp, bobBump, cpMint, bob.publicKey, bobBal.publicKey)], [bobBal]);
+
+  const [markCp, markBump] = deriveAccountPda(CP_TOKEN_PROGRAM, cpMint, mark.publicKey);
+  const markBal = Keypair.generate();
+  await sendTx(connection, payer, [initializeAccountIx(ctx, markCp, markBump, cpMint, mark.publicKey, markBal.publicKey)], [markBal]);
+  ok("Alice, Bob, Mark accounts created");
+
+  // ═══════════════════════════════════════════
+  // 3. Alice wraps 10 USDC → 10 cpUSDC
+  // ═══════════════════════════════════════════
+  log("3/9", "Alice wraps 10 USDC → 10 cpUSDC...");
+  const wrapAmountCt = await createEncryptedAmount(grpc, USDC(10), networkKey);
+  ok(`Wrap amount CT: ${wrapAmountCt.toBase58()} (via gRPC)`);
 
   await sendTx(connection, payer, [
-    initializeAccountIx(ctx, aliceAccount, aliceBump, mintPda, alice.publicKey, aliceBalanceCt.publicKey),
-  ], [aliceBalanceCt]);
-  ok(`Alice account: ${aliceAccount.toBase58()}`);
-  ok(`Alice balance CT: ${aliceBalanceCt.publicKey.toBase58()}`);
-
-  await sendTx(connection, payer, [
-    initializeAccountIx(ctx, bobAccount, bobBump, mintPda, bob.publicKey, bobBalanceCt.publicKey),
-  ], [bobBalanceCt]);
-  ok(`Bob account: ${bobAccount.toBase58()}`);
-  ok(`Bob balance CT: ${bobBalanceCt.publicKey.toBase58()}`);
-
-  // ── 3. Mint 10,000 tokens to Alice (encrypted amount via gRPC) ──
-  log("3/8", "Minting 10,000,000 (10 tokens, 6 decimals) to Alice...");
-
-  const mintAmount = 10_000_000n; // 10 tokens with 6 decimals
-  const { ciphertextIdentifiers: mintCtIds } = await grpc.createInput({
-    chain: Chain.Solana,
-    inputs: [{ ciphertextBytes: mockCiphertext(mintAmount), fheType: FHE_UINT64 }],
-    authorized: CP_TOKEN_PROGRAM.toBytes(),
-    networkEncryptionPublicKey: enc.networkKey,
-  });
-  const mintAmountCt = new PublicKey(mintCtIds[0]);
-  ok(`Mint amount CT: ${mintAmountCt.toBase58()} (encrypted via gRPC)`);
-
-  await sendTx(connection, payer, [
-    mintToIx(ctx, mintPda, aliceAccount, aliceBalanceCt.publicKey, mintAmountCt, mintAuthority.publicKey),
-  ], [mintAuthority]);
-  ok("MintTo instruction sent — waiting for executor...");
-
-  await pollUntil(connection, aliceBalanceCt.publicKey, isVerified, 120_000);
-  ok("Executor committed graph output");
-
-  // ── 4. Transfer 3,000,000 from Alice to Bob (encrypted amount) ──
-  log("4/8", "Transferring 3,000,000 (3 tokens) from Alice to Bob...");
-
-  const transferAmount = 3_000_000n;
-  const { ciphertextIdentifiers: xferCtIds } = await grpc.createInput({
-    chain: Chain.Solana,
-    inputs: [{ ciphertextBytes: mockCiphertext(transferAmount), fheType: FHE_UINT64 }],
-    authorized: CP_TOKEN_PROGRAM.toBytes(),
-    networkEncryptionPublicKey: enc.networkKey,
-  });
-  const xferAmountCt = new PublicKey(xferCtIds[0]);
-  ok(`Transfer amount CT: ${xferAmountCt.toBase58()} (encrypted via gRPC)`);
-
-  await sendTx(connection, payer, [
-    transferIx(
-      ctx,
-      aliceAccount,
-      bobAccount,
-      aliceBalanceCt.publicKey,
-      bobBalanceCt.publicKey,
-      xferAmountCt,
-      alice.publicKey,
-    ),
+    wrapIx(ctx, vaultPda, aliceCp, aliceAta.publicKey, vaultAta.publicKey,
+      aliceBal.publicKey, wrapAmountCt, alice.publicKey, USDC(10)),
   ], [alice]);
-  ok("Transfer instruction sent — waiting for executor...");
+  await pollUntil(connection, aliceBal.publicKey, isVerified, 120_000);
+  ok("Alice: 10 cpUSDC (encrypted)");
+  val("Vault USDC", `${Number(await readSplBalance(connection, vaultAta.publicKey)) / 1e6}`);
 
-  await pollUntil(connection, aliceBalanceCt.publicKey, isVerified, 120_000);
-  ok("Executor committed graph outputs");
-
-  // Fund Alice and Bob for decrypt rent (they're owners/payers in CPI)
-  const { SystemProgram, Transaction } = await import("@solana/web3.js");
-  const fundTx = new Transaction().add(
-    SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: alice.publicKey, lamports: 0.05e9 }),
-    SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: bob.publicKey, lamports: 0.05e9 }),
-  );
-  const { sendAndConfirmTransaction } = await import("@solana/web3.js");
-  await sendAndConfirmTransaction(connection, fundTx, [payer]);
-  ok("Funded Alice and Bob for decrypt rent");
-
-  // ── 5. Decrypt Alice's balance ──
-  log("5/8", "Alice requests balance decryption...");
-
-  const aliceDecReq = Keypair.generate();
+  // ═══════════════════════════════════════════
+  // 4. Alice sends 5 cpUSDC to Bob
+  // ═══════════════════════════════════════════
+  log("4/9", "Alice → Bob: 5 cpUSDC (encrypted)...");
+  const xfer1 = await createEncryptedAmount(grpc, USDC(5), networkKey);
   await sendTx(connection, payer, [
-    requestDecryptIx(ctx, aliceAccount, aliceDecReq.publicKey, aliceBalanceCt.publicKey, alice.publicKey),
-  ], [alice, aliceDecReq]);
-  ok(`Decryption requested: ${aliceDecReq.publicKey.toBase58()}`);
-
-  log("5/8", "Waiting for executor to decrypt...");
-  await pollUntil(connection, aliceDecReq.publicKey, isDecrypted, 120_000);
-  ok("Alice's balance decrypted");
-
-  // ── 6. Decrypt Bob's balance ──
-  log("6/8", "Bob requests balance decryption...");
-
-  const bobDecReq = Keypair.generate();
-  await sendTx(connection, payer, [
-    requestDecryptIx(ctx, bobAccount, bobDecReq.publicKey, bobBalanceCt.publicKey, bob.publicKey),
-  ], [bob, bobDecReq]);
-  ok(`Decryption requested: ${bobDecReq.publicKey.toBase58()}`);
-
-  log("6/8", "Waiting for executor to decrypt...");
-  await pollUntil(connection, bobDecReq.publicKey, isDecrypted, 120_000);
-  ok("Bob's balance decrypted");
-
-  // ── 7. Reveal balances on-chain ──
-  log("7/8", "Revealing balances on-chain...");
-
-  await sendTx(connection, payer, [
-    revealBalanceIx(CP_TOKEN_PROGRAM, aliceAccount, aliceDecReq.publicKey, alice.publicKey),
+    transferIx(ctx, aliceCp, bobCp, aliceBal.publicKey, bobBal.publicKey, xfer1, alice.publicKey),
   ], [alice]);
-  ok("Alice's balance revealed");
+  await pollUntil(connection, aliceBal.publicKey, isVerified, 120_000);
+  await pollUntil(connection, bobBal.publicKey, isVerified, 120_000);
+  ok("Transfer committed");
 
+  // ═══════════════════════════════════════════
+  // 5. Bob unwraps 5 cpUSDC → 5 USDC
+  // ═══════════════════════════════════════════
+  await doUnwrap(grpc, ctx, cpMint, vaultPda, vaultAta.publicKey,
+    bobCp, bobBal.publicKey, bobAta.publicKey, bob, USDC(5), "5/9");
+  val("Bob USDC", `${Number(await readSplBalance(connection, bobAta.publicKey)) / 1e6}`);
+  val("Vault USDC", `${Number(await readSplBalance(connection, vaultAta.publicKey)) / 1e6}`);
+
+  // ═══════════════════════════════════════════
+  // 6. Alice sends 3 cpUSDC to Mark
+  // ═══════════════════════════════════════════
+  log("6/9", "Alice → Mark: 3 cpUSDC (encrypted)...");
+  const xfer2 = await createEncryptedAmount(grpc, USDC(3), networkKey);
   await sendTx(connection, payer, [
-    revealBalanceIx(CP_TOKEN_PROGRAM, bobAccount, bobDecReq.publicKey, bob.publicKey),
-  ], [bob]);
-  ok("Bob's balance revealed");
+    transferIx(ctx, aliceCp, markCp, aliceBal.publicKey, markBal.publicKey, xfer2, alice.publicKey),
+  ], [alice]);
+  await pollUntil(connection, aliceBal.publicKey, isVerified, 120_000);
+  await pollUntil(connection, markBal.publicKey, isVerified, 120_000);
+  ok("Transfer committed");
 
-  // ── 8. Read and verify ──
-  log("8/8", "Reading revealed balances...");
+  // ═══════════════════════════════════════════
+  // 7. Mark unwraps 2 cpUSDC → 2 USDC
+  // ═══════════════════════════════════════════
+  await doUnwrap(grpc, ctx, cpMint, vaultPda, vaultAta.publicKey,
+    markCp, markBal.publicKey, markAta.publicKey, mark, USDC(2), "7/9");
+  val("Mark USDC", `${Number(await readSplBalance(connection, markAta.publicKey)) / 1e6}`);
+  val("Vault USDC", `${Number(await readSplBalance(connection, vaultAta.publicKey)) / 1e6}`);
 
-  const aliceData = (await connection.getAccountInfo(aliceAccount))!.data as Buffer;
-  const bobData = (await connection.getAccountInfo(bobAccount))!.data as Buffer;
+  // ═══════════════════════════════════════════
+  // 8. Alice unwraps 1 cpUSDC → 1 USDC
+  // ═══════════════════════════════════════════
+  await doUnwrap(grpc, ctx, cpMint, vaultPda, vaultAta.publicKey,
+    aliceCp, aliceBal.publicKey, aliceAta.publicKey, alice, USDC(1), "8/9");
+  val("Alice USDC", `${Number(await readSplBalance(connection, aliceAta.publicKey)) / 1e6}`);
+  val("Vault USDC", `${Number(await readSplBalance(connection, vaultAta.publicKey)) / 1e6}`);
 
-  // revealed_balance is at offset: mint(32) + owner(32) + balance(32) + delegate_flag(4) +
-  // delegate(32) + state(1) + allowance(32) + close_authority_flag(4) + close_authority(32) +
-  // pending_digest(32) = 233
-  const REVEALED_OFFSET = 233;
-  const aliceBalance = aliceData.readBigUInt64LE(REVEALED_OFFSET);
-  const bobBalance = bobData.readBigUInt64LE(REVEALED_OFFSET);
+  // ═══════════════════════════════════════════
+  // 9. Final state
+  // ═══════════════════════════════════════════
+  const aliceUsdc = await readSplBalance(connection, aliceAta.publicKey);
+  const bobUsdc = await readSplBalance(connection, bobAta.publicKey);
+  const markUsdc = await readSplBalance(connection, markAta.publicKey);
+  const vaultUsdc = await readSplBalance(connection, vaultAta.publicKey);
 
-  console.log("\n\x1b[1m═══ Results ═══\x1b[0m\n");
-  val("Alice balance", `${aliceBalance} (${Number(aliceBalance) / 1_000_000} tokens)`);
-  val("Bob balance", `${bobBalance} (${Number(bobBalance) / 1_000_000} tokens)`);
+  console.log("\n\x1b[1m═══ Final State ═══\x1b[0m\n");
+  console.log("  SPL USDC (public):");
+  val("  Alice", `${Number(aliceUsdc) / 1e6} USDC`);
+  val("  Bob  ", `${Number(bobUsdc) / 1e6} USDC`);
+  val("  Mark ", `${Number(markUsdc) / 1e6} USDC`);
+  val("  Vault", `${Number(vaultUsdc) / 1e6} USDC (locked for remaining cpUSDC)`);
+  console.log("\n  cpUSDC (encrypted — values hidden on-chain):");
+  console.log("    Alice: 1 cpUSDC");
+  console.log("    Mark:  1 cpUSDC");
 
-  const expectedAlice = mintAmount - transferAmount;
-  const expectedBob = transferAmount;
-
-  if (aliceBalance === expectedAlice && bobBalance === expectedBob) {
-    console.log(`\n  \x1b[32m✓ All balances correct!\x1b[0m`);
-    console.log(`    Alice: ${expectedAlice} (minted ${mintAmount} - transferred ${transferAmount})`);
-    console.log(`    Bob:   ${expectedBob} (received ${transferAmount})\n`);
-  } else {
-    console.log(`\n  \x1b[31m✗ Balance mismatch!\x1b[0m`);
-    console.log(`    Alice: expected ${expectedAlice}, got ${aliceBalance}`);
-    console.log(`    Bob:   expected ${expectedBob}, got ${bobBalance}\n`);
-  }
+  const allCorrect = aliceUsdc === USDC(1) && bobUsdc === USDC(5) && markUsdc === USDC(2) && vaultUsdc === USDC(2);
+  console.log(allCorrect
+    ? `\n  \x1b[32m✓ All balances correct! 10 USDC conserved.\x1b[0m\n`
+    : `\n  \x1b[31m✗ Balance mismatch!\x1b[0m\n`);
 
   grpc.close();
 }
 
-main().catch((err) => {
-  console.error("\x1b[31mError:\x1b[0m", err.message || err);
-  process.exit(1);
-});
+main().catch((err) => { console.error("\x1b[31mError:\x1b[0m", err.message || err); process.exit(1); });

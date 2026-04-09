@@ -12,6 +12,7 @@ import {
 import type { EncryptAccounts } from "../../_shared/encrypt-setup.ts";
 import { encryptCpiAccounts } from "../../_shared/encrypt-setup.ts";
 import { pda } from "../../_shared/helpers.ts";
+import { TOKEN_PROGRAM_ID } from "./spl-helpers.ts";
 
 export interface CpTokenContext {
   programId: PublicKey;
@@ -204,6 +205,109 @@ export function revealBalanceIx(
       { pubkey: tokenAccount, isSigner: false, isWritable: true },
       { pubkey: requestAcct, isSigner: false, isWritable: false },
       { pubkey: owner, isSigner: true, isWritable: false },
+    ],
+  });
+}
+
+// ── Vault / Wrap / Unwrap ──
+
+export function deriveVaultPda(
+  programId: PublicKey,
+  cpMint: PublicKey
+): [PublicKey, number] {
+  return pda([Buffer.from("cp_vault"), cpMint.toBuffer()], programId);
+}
+
+
+/** Instruction 23: InitializeVault */
+export function initializeVaultIx(
+  ctx: CpTokenContext,
+  vaultPda: PublicKey,
+  vaultBump: number,
+  cpMint: PublicKey,
+  splMint: PublicKey
+): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: ctx.programId,
+    data: Buffer.from([23, vaultBump]),
+    keys: [
+      { pubkey: vaultPda, isSigner: false, isWritable: true },
+      { pubkey: cpMint, isSigner: false, isWritable: false },
+      { pubkey: splMint, isSigner: false, isWritable: false },
+      { pubkey: ctx.payer, isSigner: true, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+  });
+}
+
+/** Instruction 30: Wrap (deposit SPL → mint cpToken) */
+export function wrapIx(
+  ctx: CpTokenContext,
+  vault: PublicKey,
+  tokenAccount: PublicKey,
+  userAta: PublicKey,
+  vaultAta: PublicKey,
+  balanceCt: PublicKey,
+  amountCt: PublicKey,
+  owner: PublicKey,
+  amount: bigint
+): TransactionInstruction {
+  const data = Buffer.alloc(10);
+  data[0] = 30; // disc
+  data[1] = ctx.cpiBump;
+  data.writeBigUInt64LE(amount, 2);
+
+  return new TransactionInstruction({
+    programId: ctx.programId,
+    data,
+    keys: [
+      { pubkey: vault, isSigner: false, isWritable: false },
+      { pubkey: tokenAccount, isSigner: false, isWritable: false },
+      { pubkey: userAta, isSigner: false, isWritable: true },
+      { pubkey: vaultAta, isSigner: false, isWritable: true },
+      { pubkey: balanceCt, isSigner: false, isWritable: true },
+      { pubkey: amountCt, isSigner: false, isWritable: true },
+      ...encryptCpiAccounts(ctx.enc, ctx.programId, ctx.cpiAuthority, owner),
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    ],
+  });
+}
+
+/** Instruction 31: Unwrap (burn cpToken + release SPL in one step)
+ *
+ * Requires prior request_decrypt + reveal_balance so the on-chain
+ * revealed_balance is set. The program checks revealed_balance >= amount.
+ */
+export function unwrapIx(
+  ctx: CpTokenContext,
+  vault: PublicKey,
+  cpMint: PublicKey,
+  tokenAccount: PublicKey,
+  vaultAta: PublicKey,
+  userAta: PublicKey,
+  balanceCt: PublicKey,
+  amountCt: PublicKey,
+  owner: PublicKey,
+  amount: bigint
+): TransactionInstruction {
+  const data = Buffer.alloc(10);
+  data[0] = 31; // disc
+  data[1] = ctx.cpiBump;
+  data.writeBigUInt64LE(amount, 2);
+
+  return new TransactionInstruction({
+    programId: ctx.programId,
+    data,
+    keys: [
+      { pubkey: vault, isSigner: false, isWritable: false },
+      { pubkey: cpMint, isSigner: false, isWritable: false },
+      { pubkey: tokenAccount, isSigner: false, isWritable: true },
+      { pubkey: vaultAta, isSigner: false, isWritable: true },
+      { pubkey: userAta, isSigner: false, isWritable: true },
+      { pubkey: balanceCt, isSigner: false, isWritable: true },
+      { pubkey: amountCt, isSigner: false, isWritable: true },
+      ...encryptCpiAccounts(ctx.enc, ctx.programId, ctx.cpiAuthority, owner),
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
     ],
   });
 }
