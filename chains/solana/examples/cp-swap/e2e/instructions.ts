@@ -68,18 +68,20 @@ export function swapIx(
 export function addLiquidityIx(
   ctx: SwapContext, pool: PublicKey,
   rA: PublicKey, rB: PublicKey, ts: PublicKey,
-  amtA: PublicKey, amtB: PublicKey, lpOut: PublicKey,
+  amtA: PublicKey, amtB: PublicKey, userLpCt: PublicKey,
 ): TransactionInstruction {
+  const [lpPda] = pda([Buffer.from("cp_lp"), pool.toBuffer(), ctx.payer.toBuffer()], ctx.programId);
   return new TransactionInstruction({
     programId: ctx.programId, data: Buffer.from([2, ctx.cpiBump]),
     keys: [
       { pubkey: pool, isSigner: false, isWritable: false },
+      { pubkey: lpPda, isSigner: false, isWritable: false },
       { pubkey: rA, isSigner: false, isWritable: true },
       { pubkey: rB, isSigner: false, isWritable: true },
       { pubkey: ts, isSigner: false, isWritable: true },
       { pubkey: amtA, isSigner: false, isWritable: true },
       { pubkey: amtB, isSigner: false, isWritable: true },
-      { pubkey: lpOut, isSigner: false, isWritable: true },
+      { pubkey: userLpCt, isSigner: false, isWritable: true },
       ...encAccts(ctx),
     ],
   });
@@ -99,16 +101,21 @@ export function requestDecryptIx(ctx: SwapContext, req: PublicKey, ct: PublicKey
 export function removeLiquidityIx(
   ctx: SwapContext, pool: PublicKey,
   rA: PublicKey, rB: PublicKey, ts: PublicKey,
-  burnCt: PublicKey, outA: PublicKey, outB: PublicKey,
+  burnCt: PublicKey, userLpCt: PublicKey,
+  outA: PublicKey, outB: PublicKey,
 ): TransactionInstruction {
+  // Derive LP position PDA for the payer
+  const [lpPda] = pda([Buffer.from("cp_lp"), pool.toBuffer(), ctx.payer.toBuffer()], ctx.programId);
   return new TransactionInstruction({
     programId: ctx.programId, data: Buffer.from([4, ctx.cpiBump]),
     keys: [
       { pubkey: pool, isSigner: false, isWritable: false },
+      { pubkey: lpPda, isSigner: false, isWritable: false },
       { pubkey: rA, isSigner: false, isWritable: true },
       { pubkey: rB, isSigner: false, isWritable: true },
       { pubkey: ts, isSigner: false, isWritable: true },
       { pubkey: burnCt, isSigner: false, isWritable: true },
+      { pubkey: userLpCt, isSigner: false, isWritable: true },
       { pubkey: outA, isSigner: false, isWritable: true },
       { pubkey: outB, isSigner: false, isWritable: true },
       ...encAccts(ctx),
