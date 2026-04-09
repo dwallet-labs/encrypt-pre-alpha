@@ -10,8 +10,8 @@
  */
 
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import { setupEncrypt, Chain } from "../../../_shared/encrypt-setup.ts";
-import { log, ok, val, sendTx, pollUntil, mockCiphertext, isVerified, isDecrypted } from "../../../_shared/helpers.ts";
+import { setupEncrypt, Chain } from "../../_shared/encrypt-setup.ts";
+import { log, ok, val, sendTx, pollUntil, mockCiphertext, isVerified, isDecrypted } from "../../_shared/helpers.ts";
 import {
   deriveCoinFlipPdas,
   createGameIx,

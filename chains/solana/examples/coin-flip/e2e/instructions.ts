@@ -8,9 +8,9 @@ import {
   TransactionInstruction,
 } from "@solana/web3.js";
 
-import type { EncryptAccounts } from "../../../_shared/encrypt-setup.ts";
-import { encryptCpiAccounts } from "../../../_shared/encrypt-setup.ts";
-import { pda } from "../../../_shared/helpers.ts";
+import type { EncryptAccounts } from "../../_shared/encrypt-setup.ts";
+import { encryptCpiAccounts } from "../../_shared/encrypt-setup.ts";
+import { pda } from "../../_shared/helpers.ts";
 
 export interface CoinFlipContext {
   programId: PublicKey;

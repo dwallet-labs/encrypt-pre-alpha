@@ -9,8 +9,8 @@
  */
 
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import { setupEncrypt, Chain } from "../../../_shared/encrypt-setup.ts";
-import { log, ok, val, sendTx, pollUntil, pda, mockCiphertext, isVerified, isDecrypted } from "../../../_shared/helpers.ts";
+import { setupEncrypt, Chain } from "../../_shared/encrypt-setup.ts";
+import { log, ok, val, sendTx, pollUntil, pda, mockCiphertext, isVerified, isDecrypted } from "../../_shared/helpers.ts";
 import {
   deriveAclPdas,
   createResourceIx,
@@ -38,7 +38,7 @@ const payer = Keypair.generate();
 /** Grant or revoke a permission and wait for executor to commit. */
 async function grantOrRevoke(
   ctx: AclContext,
-  encrypt: ReturnType<typeof import("../../../_shared/encrypt-setup.ts").setupEncrypt> extends Promise<infer T> ? T["encrypt"] : never,
+  encrypt: ReturnType<typeof import("../../_shared/encrypt-setup.ts").setupEncrypt> extends Promise<infer T> ? T["encrypt"] : never,
   permsCt: PublicKey,
   opcode: 1 | 2,
   value: bigint,
@@ -64,7 +64,7 @@ async function grantOrRevoke(
 /** Check a permission, decrypt, and return the result. */
 async function checkPermission(
   ctx: AclContext,
-  encrypt: ReturnType<typeof import("../../../_shared/encrypt-setup.ts").setupEncrypt> extends Promise<infer T> ? T["encrypt"] : never,
+  encrypt: ReturnType<typeof import("../../_shared/encrypt-setup.ts").setupEncrypt> extends Promise<infer T> ? T["encrypt"] : never,
   permsCt: PublicKey,
   checkerName: string,
   permValue: bigint

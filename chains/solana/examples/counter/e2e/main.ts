@@ -8,8 +8,8 @@
  */
 
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import { setupEncrypt } from "../../../_shared/encrypt-setup.ts";
-import { log, ok, val, sendTx, pollUntil, isVerified, isDecrypted } from "../../../_shared/helpers.ts";
+import { setupEncrypt } from "../../_shared/encrypt-setup.ts";
+import { log, ok, val, sendTx, pollUntil, isVerified, isDecrypted } from "../../_shared/helpers.ts";
 import {
   deriveCounterPdas,
   createCounterIx,
