@@ -59,6 +59,19 @@ fn add_liquidity_graph(
     (new_reserve_a, new_reserve_b)
 }
 
+#[encrypt_fn]
+fn remove_liquidity_graph(
+    reserve_a: EUint128,
+    reserve_b: EUint128,
+    share_bps: EUint128,
+) -> (EUint128, EUint128, EUint128, EUint128) {
+    let amount_a = (reserve_a * share_bps) / 10000;
+    let amount_b = (reserve_b * share_bps) / 10000;
+    let new_reserve_a = reserve_a - amount_a;
+    let new_reserve_b = reserve_b - amount_b;
+    (amount_a, amount_b, new_reserve_a, new_reserve_b)
+}
+
 const PROGRAM_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../../../target/deploy/cp_swap.so"
@@ -510,4 +523,133 @@ fn test_add_liquidity_multiple() {
 
     assert_eq!(ctx.decrypt_from_store(&pool.reserve_a), 8_000);
     assert_eq!(ctx.decrypt_from_store(&pool.reserve_b), 16_000);
+}
+
+#[test]
+fn test_remove_liquidity() {
+    let mut ctx = EncryptTestContext::new_default();
+    let (program_id, cpi_authority, cpi_bump) = setup(&mut ctx);
+
+    let pool = create_pool(&mut ctx, &program_id, &cpi_authority, cpi_bump);
+    do_add_liquidity(&mut ctx, &program_id, &cpi_authority, cpi_bump, &pool, 10_000, 20_000);
+
+    // Remove 50%
+    let share_ct = ctx.create_input::<Uint128>(5000, &program_id); // 5000 bps = 50%
+    let out_a_ct = ctx.create_input::<Uint128>(0, &program_id);
+    let out_b_ct = ctx.create_input::<Uint128>(0, &program_id);
+
+    let ix = Instruction::new_with_bytes(
+        program_id,
+        &[4u8, cpi_bump],
+        vec![
+            AccountMeta::new_readonly(pool.pda, false),
+            AccountMeta::new(pool.reserve_a, false),
+            AccountMeta::new(pool.reserve_b, false),
+            AccountMeta::new(share_ct, false),
+            AccountMeta::new(out_a_ct, false),
+            AccountMeta::new(out_b_ct, false),
+            AccountMeta::new_readonly(*ctx.program_id(), false),
+            AccountMeta::new(*ctx.config_pda(), false),
+            AccountMeta::new(*ctx.deposit_pda(), false),
+            AccountMeta::new_readonly(cpi_authority, false),
+            AccountMeta::new_readonly(program_id, false),
+            AccountMeta::new_readonly(*ctx.network_encryption_key_pda(), false),
+            AccountMeta::new(ctx.payer().pubkey(), true),
+            AccountMeta::new_readonly(*ctx.event_authority(), false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+        ],
+    );
+    ctx.send_transaction(&[ix], &[]);
+
+    let graph = remove_liquidity_graph();
+    ctx.enqueue_graph_execution(
+        &graph,
+        &[pool.reserve_a, pool.reserve_b, share_ct],
+        &[out_a_ct, out_b_ct, pool.reserve_a, pool.reserve_b],
+    );
+    ctx.process_pending();
+    ctx.register_ciphertext(&pool.reserve_a);
+    ctx.register_ciphertext(&pool.reserve_b);
+    ctx.register_ciphertext(&out_a_ct);
+    ctx.register_ciphertext(&out_b_ct);
+
+    assert_eq!(ctx.decrypt_from_store(&out_a_ct), 5_000, "withdrew 50% of A");
+    assert_eq!(ctx.decrypt_from_store(&out_b_ct), 10_000, "withdrew 50% of B");
+    assert_eq!(ctx.decrypt_from_store(&pool.reserve_a), 5_000, "remaining A");
+    assert_eq!(ctx.decrypt_from_store(&pool.reserve_b), 10_000, "remaining B");
+}
+
+#[test]
+fn test_full_lifecycle() {
+    let mut ctx = EncryptTestContext::new_default();
+    let (program_id, cpi_authority, cpi_bump) = setup(&mut ctx);
+
+    // Create + add liquidity
+    let pool = create_pool(&mut ctx, &program_id, &cpi_authority, cpi_bump);
+    do_add_liquidity(&mut ctx, &program_id, &cpi_authority, cpi_bump, &pool, 10_000, 10_000);
+
+    let initial_k = 10_000u128 * 10_000u128;
+
+    // Swap A→B
+    let out1 = do_swap(&mut ctx, &program_id, &cpi_authority, cpi_bump, &pool, 1000, 0, 0);
+    assert!(out1 > 0);
+
+    // Swap B→A
+    let out2 = do_swap(&mut ctx, &program_id, &cpi_authority, cpi_bump, &pool, 500, 0, 1);
+    assert!(out2 > 0);
+
+    // k still holds
+    let ra = ctx.decrypt_from_store(&pool.reserve_a);
+    let rb = ctx.decrypt_from_store(&pool.reserve_b);
+    assert!(ra * rb >= initial_k, "k invariant after swaps");
+
+    // Remove 100% liquidity
+    let share_ct = ctx.create_input::<Uint128>(10000, &program_id);
+    let out_a = ctx.create_input::<Uint128>(0, &program_id);
+    let out_b = ctx.create_input::<Uint128>(0, &program_id);
+
+    let ix = Instruction::new_with_bytes(
+        program_id,
+        &[4u8, cpi_bump],
+        vec![
+            AccountMeta::new_readonly(pool.pda, false),
+            AccountMeta::new(pool.reserve_a, false),
+            AccountMeta::new(pool.reserve_b, false),
+            AccountMeta::new(share_ct, false),
+            AccountMeta::new(out_a, false),
+            AccountMeta::new(out_b, false),
+            AccountMeta::new_readonly(*ctx.program_id(), false),
+            AccountMeta::new(*ctx.config_pda(), false),
+            AccountMeta::new(*ctx.deposit_pda(), false),
+            AccountMeta::new_readonly(cpi_authority, false),
+            AccountMeta::new_readonly(program_id, false),
+            AccountMeta::new_readonly(*ctx.network_encryption_key_pda(), false),
+            AccountMeta::new(ctx.payer().pubkey(), true),
+            AccountMeta::new_readonly(*ctx.event_authority(), false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+        ],
+    );
+    ctx.send_transaction(&[ix], &[]);
+
+    let graph = remove_liquidity_graph();
+    ctx.enqueue_graph_execution(
+        &graph,
+        &[pool.reserve_a, pool.reserve_b, share_ct],
+        &[out_a, out_b, pool.reserve_a, pool.reserve_b],
+    );
+    ctx.process_pending();
+    ctx.register_ciphertext(&pool.reserve_a);
+    ctx.register_ciphertext(&pool.reserve_b);
+    ctx.register_ciphertext(&out_a);
+    ctx.register_ciphertext(&out_b);
+
+    // Withdrawn amounts should equal final reserves (100% removal)
+    assert_eq!(ctx.decrypt_from_store(&out_a), ra, "withdrew all A");
+    assert_eq!(ctx.decrypt_from_store(&out_b), rb, "withdrew all B");
+    assert_eq!(ctx.decrypt_from_store(&pool.reserve_a), 0, "pool empty A");
+    assert_eq!(ctx.decrypt_from_store(&pool.reserve_b), 0, "pool empty B");
+
+    // Total withdrawn should be more than deposited (fees!)
+    let total_withdrawn = ctx.decrypt_from_store(&out_a) + ctx.decrypt_from_store(&out_b);
+    assert!(total_withdrawn > 20_000, "LP earned fees");
 }

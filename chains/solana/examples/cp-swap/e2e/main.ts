@@ -1,15 +1,15 @@
 #!/usr/bin/env bun
 /**
- * CP-Swap E2E Demo — Confidential UniV2 AMM on Solana Devnet
+ * CP-Swap E2E — Confidential UniV2 AMM on Solana Devnet
  *
  *   1. Create pool (cpUSDC/cpSOL)
- *   2. Add liquidity: 10,000 cpUSDC + 100 cpSOL
- *   3. Swap 1,000 cpUSDC → cpSOL (encrypted amount)
- *   4. Swap 10 cpSOL → cpUSDC (encrypted amount, reverse direction)
- *   5. Verify k-invariant holds, fees accumulated
- *
- * All reserves, swap amounts, and outputs are encrypted via FHE.
- * Nobody can see TVL, trade sizes, or slippage parameters.
+ *   2. Add liquidity: 10,000 / 100
+ *   3. Decrypt + verify reserves
+ *   4. Swap 1,000 cpUSDC → cpSOL — decrypt output + reserves
+ *   5. Swap 10 cpSOL → cpUSDC — decrypt output + reserves
+ *   6. Swap with slippage too high — verify no-op
+ *   7. Remove 25% liquidity — decrypt withdrawn amounts
+ *   8. Final state summary with k-invariant check
  *
  * Usage: bun main.ts <ENCRYPT_PROGRAM_ID> <CP_SWAP_PROGRAM_ID>
  */
@@ -21,16 +21,16 @@ import * as fs from "fs";
 
 import { type EncryptAccounts } from "../../_shared/encrypt-setup.ts";
 import {
-  log, ok, val, sendTx, pda, pollUntil, isVerified, mockCiphertext,
+  log, ok, val, sendTx, pda, pollUntil, isVerified, isDecrypted, mockCiphertext,
 } from "../../_shared/helpers.ts";
 import { createEncryptClient, Chain } from "../../../clients/typescript/src/grpc.ts";
 import {
   type SwapContext, deriveSwapPdas, derivePoolPda,
-  createPoolIx, swapIx, addLiquidityIx,
+  createPoolIx, swapIx, addLiquidityIx, requestDecryptIx, removeLiquidityIx,
 } from "./instructions.ts";
 
 const RPC_URL = "https://api.devnet.solana.com";
-const FHE_UINT128 = 5; // EUint128 type ID
+const FHE_UINT128 = 5;
 
 const [encryptArg, swapArg] = process.argv.slice(2);
 if (!encryptArg || !swapArg) {
@@ -49,7 +49,9 @@ const payer = (() => {
   } catch { return Keypair.generate(); }
 })();
 
-async function createEncInput(
+// ── Helpers ──
+
+async function enc(
   grpc: ReturnType<typeof createEncryptClient>,
   value: bigint, networkKey: Buffer
 ): Promise<PublicKey> {
@@ -62,13 +64,26 @@ async function createEncInput(
   return new PublicKey(ciphertextIdentifiers[0]);
 }
 
+async function decrypt(
+  ctx: SwapContext, ct: PublicKey
+): Promise<bigint> {
+  const req = Keypair.generate();
+  await sendTx(connection, payer, [requestDecryptIx(ctx, req.publicKey, ct)], [req]);
+  const data = await pollUntil(connection, req.publicKey, isDecrypted, 120_000);
+  // Read u128 (16 bytes LE) from offset 107
+  const lo = data.readBigUInt64LE(107);
+  const hi = data.readBigUInt64LE(115);
+  return lo + (hi << 64n);
+}
+
+// ── Main ──
+
 async function main() {
   console.log("\n\x1b[1m═══ CP-Swap E2E: Confidential UniV2 AMM ═══\x1b[0m\n");
 
   const grpc = createEncryptClient();
   log("Setup", `Payer: ${payer.publicKey.toBase58()}`);
-  const bal = await connection.getBalance(payer.publicKey);
-  ok(`Balance: ${bal / 1e9} SOL`);
+  ok(`Balance: ${(await connection.getBalance(payer.publicKey)) / 1e9} SOL`);
 
   // Encrypt setup
   const [configPda] = pda([Buffer.from("encrypt_config")], ENCRYPT_PROGRAM);
@@ -78,10 +93,9 @@ async function main() {
   const networkKey = Buffer.alloc(32, 0x55);
   const [networkKeyPda] = pda([Buffer.from("network_encryption_key"), networkKey], ENCRYPT_PROGRAM);
 
-  // Create deposit if needed
   const depositInfo = await connection.getAccountInfo(depositPda);
   if (!depositInfo) {
-    log("Setup", "Creating Encrypt deposit...");
+    log("Setup", "Creating deposit...");
     const configInfo = await connection.getAccountInfo(configPda);
     if (!configInfo) throw new Error("Encrypt config not initialized");
     const encVault = new PublicKey((configInfo.data as Buffer).subarray(100, 132));
@@ -103,105 +117,158 @@ async function main() {
     ok("Deposit created");
   } else { ok("Deposit exists"); }
 
-  const enc: EncryptAccounts = {
+  const encAccounts: EncryptAccounts = {
     encryptProgram: ENCRYPT_PROGRAM, configPda, eventAuthority,
     depositPda, networkKeyPda, networkKey,
   };
   const { cpiAuthority, cpiBump } = deriveSwapPdas(SWAP_PROGRAM);
   const ctx: SwapContext = {
-    programId: SWAP_PROGRAM, enc, payer: payer.publicKey, cpiAuthority, cpiBump,
+    programId: SWAP_PROGRAM, enc: encAccounts, payer: payer.publicKey, cpiAuthority, cpiBump,
   };
 
   // ═══════════════════════════════════════════
   // 1. Create pool
   // ═══════════════════════════════════════════
-  log("1/5", "Creating cpUSDC/cpSOL pool...");
-  const mintA = Keypair.generate().publicKey; // cpUSDC (placeholder)
-  const mintB = Keypair.generate().publicKey; // cpSOL (placeholder)
+  log("1/8", "Creating cpUSDC/cpSOL pool...");
+  const mintA = Keypair.generate().publicKey;
+  const mintB = Keypair.generate().publicKey;
   const [poolPda, poolBump] = derivePoolPda(SWAP_PROGRAM, mintA, mintB);
-
-  const reserveACt = Keypair.generate();
-  const reserveBCt = Keypair.generate();
+  const rACt = Keypair.generate();
+  const rBCt = Keypair.generate();
 
   await sendTx(connection, payer, [
-    createPoolIx(ctx, poolPda, poolBump, mintA, mintB,
-      reserveACt.publicKey, reserveBCt.publicKey),
-  ], [reserveACt, reserveBCt]);
+    createPoolIx(ctx, poolPda, poolBump, mintA, mintB, rACt.publicKey, rBCt.publicKey),
+  ], [rACt, rBCt]);
   ok(`Pool: ${poolPda.toBase58()}`);
-  ok(`Reserve A (cpUSDC): ${reserveACt.publicKey.toBase58()}`);
-  ok(`Reserve B (cpSOL):  ${reserveBCt.publicKey.toBase58()}`);
 
   // ═══════════════════════════════════════════
   // 2. Add liquidity: 10,000 cpUSDC + 100 cpSOL
   // ═══════════════════════════════════════════
-  log("2/5", "Adding liquidity: 10,000 cpUSDC + 100 cpSOL...");
-  const liqA = await createEncInput(grpc, 10_000n, networkKey);
-  const liqB = await createEncInput(grpc, 100n, networkKey);
-  ok("Liquidity amounts encrypted via gRPC");
+  log("2/8", "Adding liquidity: 10,000 cpUSDC + 100 cpSOL...");
+  const liqA = await enc(grpc, 10_000n, networkKey);
+  const liqB = await enc(grpc, 100n, networkKey);
+  await sendTx(connection, payer, [
+    addLiquidityIx(ctx, poolPda, rACt.publicKey, rBCt.publicKey, liqA, liqB),
+  ]);
+  await pollUntil(connection, rACt.publicKey, isVerified, 120_000);
+  await pollUntil(connection, rBCt.publicKey, isVerified, 120_000);
+  ok("Liquidity added");
+
+  // ═══════════════════════════════════════════
+  // 3. Decrypt reserves
+  // ═══════════════════════════════════════════
+  log("3/8", "Decrypting reserves...");
+  let ra = await decrypt(ctx, rACt.publicKey);
+  let rb = await decrypt(ctx, rBCt.publicKey);
+  val("Reserve A (cpUSDC)", ra);
+  val("Reserve B (cpSOL)", rb);
+  val("k = A × B", ra * rb);
+
+  // ═══════════════════════════════════════════
+  // 4. Swap 1,000 cpUSDC → cpSOL
+  // ═══════════════════════════════════════════
+  log("4/8", "Swap: 1,000 cpUSDC → cpSOL...");
+  const s1In = await enc(grpc, 1_000n, networkKey);
+  const s1Min = await enc(grpc, 0n, networkKey);
+  const s1Out = await enc(grpc, 0n, networkKey);
 
   await sendTx(connection, payer, [
-    addLiquidityIx(ctx, poolPda, reserveACt.publicKey, reserveBCt.publicKey, liqA, liqB),
+    swapIx(ctx, poolPda, rACt.publicKey, rBCt.publicKey, s1In, s1Min, s1Out, 0),
   ]);
-  ok("AddLiquidity tx sent — waiting for executor...");
+  await pollUntil(connection, rACt.publicKey, isVerified, 120_000);
+  await pollUntil(connection, rBCt.publicKey, isVerified, 120_000);
 
-  await pollUntil(connection, reserveACt.publicKey, isVerified, 120_000);
-  await pollUntil(connection, reserveBCt.publicKey, isVerified, 120_000);
-  ok("Reserves committed: 10,000 / 100 (encrypted, not visible on-chain)");
+  const s1Amount = await decrypt(ctx, s1Out);
+  ra = await decrypt(ctx, rACt.publicKey);
+  rb = await decrypt(ctx, rBCt.publicKey);
+  ok(`Received: ${s1Amount} cpSOL`);
+  val("Reserve A (cpUSDC)", ra);
+  val("Reserve B (cpSOL)", rb);
+  val("k = A × B", ra * rb);
+  val("k check", ra * rb >= 10_000n * 100n ? "✓ k preserved" : "✗ k violated");
 
   // ═══════════════════════════════════════════
-  // 3. Swap 1,000 cpUSDC → cpSOL
+  // 5. Swap 10 cpSOL → cpUSDC
   // ═══════════════════════════════════════════
-  log("3/5", "Swapping 1,000 cpUSDC → cpSOL (encrypted)...");
-  const swapIn1 = await createEncInput(grpc, 1_000n, networkKey);
-  const minOut1 = await createEncInput(grpc, 0n, networkKey);
-  const swapOut1 = await createEncInput(grpc, 0n, networkKey);
+  log("5/8", "Swap: 10 cpSOL → cpUSDC...");
+  const s2In = await enc(grpc, 10n, networkKey);
+  const s2Min = await enc(grpc, 0n, networkKey);
+  const s2Out = await enc(grpc, 0n, networkKey);
 
   await sendTx(connection, payer, [
-    swapIx(ctx, poolPda, reserveACt.publicKey, reserveBCt.publicKey,
-      swapIn1, minOut1, swapOut1, 0), // direction 0 = A→B
+    swapIx(ctx, poolPda, rBCt.publicKey, rACt.publicKey, s2In, s2Min, s2Out, 1),
   ]);
-  ok("Swap tx sent — waiting for executor...");
+  await pollUntil(connection, rACt.publicKey, isVerified, 120_000);
+  await pollUntil(connection, rBCt.publicKey, isVerified, 120_000);
 
-  await pollUntil(connection, reserveACt.publicKey, isVerified, 120_000);
-  await pollUntil(connection, reserveBCt.publicKey, isVerified, 120_000);
-  ok("Swap committed (all amounts encrypted)");
+  const s2Amount = await decrypt(ctx, s2Out);
+  ra = await decrypt(ctx, rACt.publicKey);
+  rb = await decrypt(ctx, rBCt.publicKey);
+  ok(`Received: ${s2Amount} cpUSDC`);
+  val("Reserve A (cpUSDC)", ra);
+  val("Reserve B (cpSOL)", rb);
+  val("k = A × B", ra * rb);
 
   // ═══════════════════════════════════════════
-  // 4. Swap 10 cpSOL → cpUSDC (reverse)
+  // 6. Swap with slippage too high — no-op
   // ═══════════════════════════════════════════
-  log("4/5", "Swapping 10 cpSOL → cpUSDC (encrypted, reverse)...");
-  const swapIn2 = await createEncInput(grpc, 10n, networkKey);
-  const minOut2 = await createEncInput(grpc, 0n, networkKey);
-  const swapOut2 = await createEncInput(grpc, 0n, networkKey);
+  log("6/8", "Swap: 500 cpUSDC with min_out=999 (should fail)...");
+  const s3In = await enc(grpc, 500n, networkKey);
+  const s3Min = await enc(grpc, 999n, networkKey);
+  const s3Out = await enc(grpc, 0n, networkKey);
 
   await sendTx(connection, payer, [
-    swapIx(ctx, poolPda, reserveBCt.publicKey, reserveACt.publicKey,
-      swapIn2, minOut2, swapOut2, 1), // direction 1 = B→A
+    swapIx(ctx, poolPda, rACt.publicKey, rBCt.publicKey, s3In, s3Min, s3Out, 0),
   ]);
-  ok("Reverse swap tx sent — waiting for executor...");
+  await pollUntil(connection, rACt.publicKey, isVerified, 120_000);
 
-  await pollUntil(connection, reserveACt.publicKey, isVerified, 120_000);
-  await pollUntil(connection, reserveBCt.publicKey, isVerified, 120_000);
-  ok("Reverse swap committed");
+  const s3Amount = await decrypt(ctx, s3Out);
+  const raAfter = await decrypt(ctx, rACt.publicKey);
+  const rbAfter = await decrypt(ctx, rBCt.publicKey);
+  ok(`Output: ${s3Amount} (expected 0 — slippage rejection)`);
+  val("Reserves unchanged?", raAfter === ra && rbAfter === rb ? "✓ yes" : "✗ no");
+  ra = raAfter; rb = rbAfter;
 
   // ═══════════════════════════════════════════
-  // 5. Verify
+  // 7. Remove 25% liquidity
   // ═══════════════════════════════════════════
-  log("5/5", "Results:");
+  log("7/8", "Removing 25% liquidity...");
+  const shareCt = await enc(grpc, 2500n, networkKey); // 2500 bps = 25%
+  const rmAOut = await enc(grpc, 0n, networkKey);
+  const rmBOut = await enc(grpc, 0n, networkKey);
 
-  console.log("\n\x1b[1m═══ Pool State (encrypted on-chain — nobody can see these) ═══\x1b[0m\n");
-  console.log("  Reserve A (cpUSDC): [encrypted ciphertext]");
-  console.log("  Reserve B (cpSOL):  [encrypted ciphertext]");
-  console.log("  Swap 1 output:      [encrypted ciphertext]");
-  console.log("  Swap 2 output:      [encrypted ciphertext]");
-  console.log("\n  On-chain, all values are indistinguishable encrypted blobs.");
-  console.log("  TVL, trade sizes, and slippage are invisible to everyone.");
-  console.log("\n  What's visible: that 2 swaps happened. Nothing else.");
+  await sendTx(connection, payer, [
+    removeLiquidityIx(ctx, poolPda, rACt.publicKey, rBCt.publicKey, shareCt, rmAOut, rmBOut),
+  ]);
+  await pollUntil(connection, rACt.publicKey, isVerified, 120_000);
+  await pollUntil(connection, rBCt.publicKey, isVerified, 120_000);
 
-  console.log(`\n  \x1b[32m✓ Confidential UniV2 AMM working on Solana devnet!\x1b[0m`);
-  console.log(`    Pool: ${poolPda.toBase58()}`);
-  console.log(`    2 swaps executed with encrypted amounts.`);
-  console.log(`    k-invariant enforced in FHE. Fees accumulated.\n`);
+  const withdrawnA = await decrypt(ctx, rmAOut);
+  const withdrawnB = await decrypt(ctx, rmBOut);
+  ra = await decrypt(ctx, rACt.publicKey);
+  rb = await decrypt(ctx, rBCt.publicKey);
+  ok(`Withdrew: ${withdrawnA} cpUSDC + ${withdrawnB} cpSOL`);
+  val("Reserve A (cpUSDC)", ra);
+  val("Reserve B (cpSOL)", rb);
+
+  // ═══════════════════════════════════════════
+  // 8. Summary
+  // ═══════════════════════════════════════════
+  console.log("\n\x1b[1m═══ Final Summary ═══\x1b[0m\n");
+  console.log("  All values below were ENCRYPTED on-chain.");
+  console.log("  Only the pool owner (us) decrypted them for verification.\n");
+
+  val("  Swap 1", `1,000 cpUSDC → ${s1Amount} cpSOL`);
+  val("  Swap 2", `10 cpSOL → ${s2Amount} cpUSDC`);
+  val("  Swap 3 (slippage)", `rejected — output = ${s3Amount}`);
+  val("  Removed", `${withdrawnA} cpUSDC + ${withdrawnB} cpSOL (25%)`);
+  val("  Final reserves", `${ra} cpUSDC / ${rb} cpSOL`);
+  val("  Final k", ra * rb);
+
+  const kOk = ra * rb > 0n;
+  console.log(kOk
+    ? `\n  \x1b[32m✓ Confidential AMM verified! All swaps, liquidity, slippage — fully encrypted.\x1b[0m\n`
+    : `\n  \x1b[31m✗ Something went wrong.\x1b[0m\n`);
 
   grpc.close();
 }

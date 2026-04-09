@@ -123,13 +123,7 @@ fn swap_graph(
     (final_out, final_reserve_in, final_reserve_out)
 }
 
-/// Add liquidity: deposit both tokens proportionally.
-/// Returns (new_reserve_a, new_reserve_b, lp_amount).
-/// lp_amount = sqrt(amount_a * amount_b) for initial deposit,
-/// or proportional to existing reserves for subsequent deposits.
-///
-/// Simplified: always uses geometric mean (sqrt) for LP calculation.
-/// A production AMM would track total_supply for proportional minting.
+/// Add liquidity: deposit both tokens into the pool.
 #[encrypt_fn]
 fn add_liquidity_graph(
     reserve_a: EUint128,
@@ -140,6 +134,25 @@ fn add_liquidity_graph(
     let new_reserve_a = reserve_a + amount_a;
     let new_reserve_b = reserve_b + amount_b;
     (new_reserve_a, new_reserve_b)
+}
+
+/// Remove liquidity: withdraw proportional to share.
+///
+/// `share_bps` is the share to withdraw in basis points (e.g., 5000 = 50%).
+/// Computes: amount_a = reserve_a * share_bps / 10000
+///           amount_b = reserve_b * share_bps / 10000
+/// Returns (amount_a_out, amount_b_out, new_reserve_a, new_reserve_b).
+#[encrypt_fn]
+fn remove_liquidity_graph(
+    reserve_a: EUint128,
+    reserve_b: EUint128,
+    share_bps: EUint128,
+) -> (EUint128, EUint128, EUint128, EUint128) {
+    let amount_a = (reserve_a * share_bps) / 10000;
+    let amount_b = (reserve_b * share_bps) / 10000;
+    let new_reserve_a = reserve_a - amount_a;
+    let new_reserve_b = reserve_b - amount_b;
+    (amount_a, amount_b, new_reserve_a, new_reserve_b)
 }
 
 // ── Instruction dispatch ──
@@ -153,6 +166,8 @@ fn process_instruction(
         Some((&0, rest)) => create_pool(program_id, accounts, rest),
         Some((&1, rest)) => swap(accounts, rest),
         Some((&2, rest)) => add_liquidity(accounts, rest),
+        Some((&3, rest)) => request_decrypt(accounts, rest),
+        Some((&4, rest)) => remove_liquidity(accounts, rest),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -378,6 +393,113 @@ fn add_liquidity(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     Ok(())
 }
 
+// ── 3: RequestDecrypt ──
+// data: cpi_authority_bump(1)
+// accounts: [request_acct(w,s), ciphertext,
+//            encrypt_program, config, deposit(w), cpi_authority,
+//            caller_program, network_encryption_key, payer(s,w),
+//            event_authority, system_program]
+//
+// Requests decryption of any ciphertext owned by this program.
+// Used to read pool reserves and swap outputs for verification.
+
+fn request_decrypt(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [request_acct, ciphertext, encrypt_program, config, deposit, cpi_authority, caller_program, network_encryption_key, payer, event_authority, system_program, ..] =
+        accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if !payer.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let cpi_authority_bump = data[0];
+
+    let ctx = EncryptContext {
+        encrypt_program,
+        config,
+        deposit,
+        cpi_authority,
+        caller_program,
+        network_encryption_key,
+        payer,
+        event_authority,
+        system_program,
+        cpi_authority_bump,
+    };
+
+    ctx.request_decryption(request_acct, ciphertext)?;
+    Ok(())
+}
+
+// ── 4: RemoveLiquidity ──
+// data: cpi_authority_bump(1)
+// accounts: [pool, reserve_a_ct(w), reserve_b_ct(w),
+//            share_bps_ct, amount_a_out_ct(w), amount_b_out_ct(w),
+//            encrypt_program, config, deposit(w), cpi_authority,
+//            caller_program, network_encryption_key, payer(s,w),
+//            event_authority, system_program]
+//
+// Removes liquidity proportional to share_bps (basis points, e.g. 5000 = 50%).
+// amount_a_out_ct and amount_b_out_ct receive the withdrawn amounts.
+
+fn remove_liquidity(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [pool_acct, reserve_a_ct, reserve_b_ct, share_bps_ct, amount_a_out_ct, amount_b_out_ct, encrypt_program, config, deposit, cpi_authority, caller_program, network_encryption_key, payer, event_authority, system_program, ..] =
+        accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if !payer.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let cpi_authority_bump = data[0];
+
+    let pool_data = unsafe { pool_acct.borrow_unchecked() };
+    let pool = Pool::from_bytes(pool_data)?;
+    if pool.is_initialized != 1 {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if reserve_a_ct.address().as_ref() != &pool.reserve_a {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if reserve_b_ct.address().as_ref() != &pool.reserve_b {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let ctx = EncryptContext {
+        encrypt_program,
+        config,
+        deposit,
+        cpi_authority,
+        caller_program,
+        network_encryption_key,
+        payer,
+        event_authority,
+        system_program,
+        cpi_authority_bump,
+    };
+
+    // (amount_a, amount_b, new_reserve_a, new_reserve_b)
+    ctx.remove_liquidity_graph(
+        reserve_a_ct,
+        reserve_b_ct,
+        share_bps_ct,
+        amount_a_out_ct,
+        amount_b_out_ct,
+        reserve_a_ct,
+        reserve_b_ct,
+    )?;
+
+    Ok(())
+}
+
 // ── Tests ──
 
 #[cfg(test)]
@@ -386,7 +508,7 @@ mod tests {
     use encrypt_types::identifier::*;
     use encrypt_types::types::FheType;
 
-    use super::{add_liquidity_graph, swap_graph};
+    use super::{add_liquidity_graph, remove_liquidity_graph, swap_graph};
 
     fn run_mock(graph_fn: fn() -> Vec<u8>, inputs: &[u128], fhe_types: &[FheType]) -> Vec<u128> {
         let data = graph_fn();
@@ -500,16 +622,175 @@ mod tests {
         assert_eq!(r[1], 3000, "reserve_b + amount_b");
     }
 
+    // ── Edge cases: swap ──
+
+    #[test]
+    fn swap_tiny_amount() {
+        let t = FheType::EUint128;
+        // Swap 1 token with large reserves — output might round to 0
+        let r = run_mock(swap_graph, &[1_000_000, 1_000_000, 1, 0], &[t, t, t, t]);
+        // With fee: 1 * 997 * 1000000 / (1000000 * 1000 + 997) = 997000000 / 1000000997 = 0
+        // Integer division rounds down to 0, so no-op (k check fails or output=0)
+        // Either way reserves should be safe
+        let old_k = 1_000_000u128 * 1_000_000u128;
+        assert!(r[1] * r[2] >= old_k || r[0] == 0, "k invariant or no-op");
+    }
+
+    #[test]
+    fn swap_large_amount_exceeding_reserve() {
+        let t = FheType::EUint128;
+        // Swap 50,000 into a pool with 10,000/10,000 — huge price impact
+        let r = run_mock(swap_graph, &[10_000, 10_000, 50_000, 0], &[t, t, t, t]);
+        assert!(r[0] > 0, "should get some output");
+        assert!(r[0] < 10_000, "can't get more than entire reserve_out");
+        assert_eq!(r[1], 60_000, "reserve_in = 10000 + 50000");
+        assert!(r[1] * r[2] >= 10_000 * 10_000, "k invariant");
+    }
+
+    #[test]
+    fn swap_equal_reserves() {
+        let t = FheType::EUint128;
+        let r = run_mock(swap_graph, &[5000, 5000, 1000, 0], &[t, t, t, t]);
+        assert!(r[0] > 0);
+        // Symmetric pool: amount_out < amount_in due to fee
+        assert!(r[0] < 1000, "output < input due to fee");
+        assert!(r[1] * r[2] >= 5000 * 5000, "k invariant");
+    }
+
+    #[test]
+    fn swap_exact_slippage_boundary() {
+        let t = FheType::EUint128;
+        // First compute expected output
+        let r1 = run_mock(swap_graph, &[10_000, 10_000, 1000, 0], &[t, t, t, t]);
+        let exact_out = r1[0];
+        assert!(exact_out > 0);
+
+        // Now swap with min_amount_out = exact output — should succeed
+        let r2 = run_mock(swap_graph, &[10_000, 10_000, 1000, exact_out], &[t, t, t, t]);
+        assert_eq!(r2[0], exact_out, "exact slippage boundary passes");
+
+        // min_amount_out = exact + 1 — should fail (no-op)
+        let r3 = run_mock(swap_graph, &[10_000, 10_000, 1000, exact_out + 1], &[t, t, t, t]);
+        assert_eq!(r3[0], 0, "slippage exceeded by 1 → no-op");
+        assert_eq!(r3[1], 10_000, "reserves unchanged");
+    }
+
+    #[test]
+    fn swap_very_asymmetric_pool() {
+        let t = FheType::EUint128;
+        // Pool: 1,000,000 A, 1 B — extremely skewed
+        let r = run_mock(swap_graph, &[1_000_000, 1, 1000, 0], &[t, t, t, t]);
+        // amount_out = (1000 * 997 * 1) / (1000000 * 1000 + 1000 * 997) = 997 / 1000997000 = 0
+        assert_eq!(r[0], 0, "can't get anything from near-empty reserve");
+    }
+
+    #[test]
+    fn swap_preserves_k_across_many() {
+        let t = FheType::EUint128;
+        let mut ra: u128 = 100_000;
+        let mut rb: u128 = 100_000;
+        let initial_k = ra * rb;
+
+        // 20 random-ish swaps alternating direction
+        let amounts = [500, 300, 1000, 50, 2000, 100, 800, 1500, 200, 3000];
+        for (i, &amt) in amounts.iter().enumerate() {
+            let (rin, rout) = if i % 2 == 0 { (ra, rb) } else { (rb, ra) };
+            let r = run_mock(swap_graph, &[rin, rout, amt, 0], &[t, t, t, t]);
+            if i % 2 == 0 {
+                ra = r[1]; rb = r[2];
+            } else {
+                rb = r[1]; ra = r[2];
+            }
+        }
+        assert!(ra * rb >= initial_k, "k never decreases after 10 swaps");
+    }
+
+    // ── Edge cases: remove liquidity ──
+
+    #[test]
+    fn remove_liquidity_half() {
+        let t = FheType::EUint128;
+        let r = run_mock(remove_liquidity_graph, &[10_000, 20_000, 5000], &[t, t, t]);
+        assert_eq!(r[0], 5_000, "withdraw 50% of A");
+        assert_eq!(r[1], 10_000, "withdraw 50% of B");
+        assert_eq!(r[2], 5_000, "remaining A");
+        assert_eq!(r[3], 10_000, "remaining B");
+    }
+
+    #[test]
+    fn remove_liquidity_full() {
+        let t = FheType::EUint128;
+        let r = run_mock(remove_liquidity_graph, &[10_000, 20_000, 10000], &[t, t, t]);
+        assert_eq!(r[0], 10_000, "withdraw 100% of A");
+        assert_eq!(r[1], 20_000, "withdraw 100% of B");
+        assert_eq!(r[2], 0, "nothing left A");
+        assert_eq!(r[3], 0, "nothing left B");
+    }
+
+    #[test]
+    fn remove_liquidity_quarter() {
+        let t = FheType::EUint128;
+        let r = run_mock(remove_liquidity_graph, &[8_000, 4_000, 2500], &[t, t, t]);
+        assert_eq!(r[0], 2_000, "withdraw 25% of A");
+        assert_eq!(r[1], 1_000, "withdraw 25% of B");
+        assert_eq!(r[2], 6_000, "remaining A");
+        assert_eq!(r[3], 3_000, "remaining B");
+    }
+
+    #[test]
+    fn remove_liquidity_tiny_share() {
+        let t = FheType::EUint128;
+        // 1 bps = 0.01%
+        let r = run_mock(remove_liquidity_graph, &[1_000_000, 500_000, 1], &[t, t, t]);
+        assert_eq!(r[0], 100, "0.01% of 1M = 100");
+        assert_eq!(r[1], 50, "0.01% of 500K = 50");
+    }
+
+    #[test]
+    fn remove_liquidity_zero_share() {
+        let t = FheType::EUint128;
+        let r = run_mock(remove_liquidity_graph, &[10_000, 20_000, 0], &[t, t, t]);
+        assert_eq!(r[0], 0, "withdraw 0% = nothing");
+        assert_eq!(r[1], 0);
+        assert_eq!(r[2], 10_000, "reserves unchanged");
+        assert_eq!(r[3], 20_000);
+    }
+
+    // ── Edge cases: add liquidity ──
+
+    #[test]
+    fn add_liquidity_to_empty() {
+        let t = FheType::EUint128;
+        let r = run_mock(add_liquidity_graph, &[0, 0, 1000, 2000], &[t, t, t, t]);
+        assert_eq!(r[0], 1000);
+        assert_eq!(r[1], 2000);
+    }
+
+    #[test]
+    fn add_liquidity_zero_amounts() {
+        let t = FheType::EUint128;
+        let r = run_mock(add_liquidity_graph, &[1000, 2000, 0, 0], &[t, t, t, t]);
+        assert_eq!(r[0], 1000, "unchanged");
+        assert_eq!(r[1], 2000, "unchanged");
+    }
+
+    // ── Graph shapes ──
+
     #[test]
     fn graph_shapes() {
         let g = swap_graph();
         let pg = parse_graph(&g).unwrap();
-        assert_eq!(pg.header().num_inputs(), 4, "swap: reserve_in + reserve_out + amount_in + min_amount_out");
-        assert_eq!(pg.header().num_outputs(), 3, "swap: amount_out + new_reserve_in + new_reserve_out");
+        assert_eq!(pg.header().num_inputs(), 4);
+        assert_eq!(pg.header().num_outputs(), 3);
 
         let g = add_liquidity_graph();
         let pg = parse_graph(&g).unwrap();
         assert_eq!(pg.header().num_inputs(), 4);
         assert_eq!(pg.header().num_outputs(), 2);
+
+        let g = remove_liquidity_graph();
+        let pg = parse_graph(&g).unwrap();
+        assert_eq!(pg.header().num_inputs(), 3);
+        assert_eq!(pg.header().num_outputs(), 4);
     }
 }

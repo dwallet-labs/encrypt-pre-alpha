@@ -89,6 +89,50 @@ export function swapIx(
   });
 }
 
+/** Instruction 3: RequestDecrypt */
+export function requestDecryptIx(
+  ctx: SwapContext,
+  requestAcct: PublicKey,
+  ciphertext: PublicKey,
+): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: ctx.programId,
+    data: Buffer.from([3, ctx.cpiBump]),
+    keys: [
+      { pubkey: requestAcct, isSigner: true, isWritable: true },
+      { pubkey: ciphertext, isSigner: false, isWritable: false },
+      ...encryptCpiAccounts(ctx.enc, ctx.programId, ctx.cpiAuthority, ctx.payer).map(
+        (a) => a.pubkey.equals(ctx.enc.configPda) ? { ...a, isWritable: false } : a
+      ),
+    ],
+  });
+}
+
+/** Instruction 4: RemoveLiquidity */
+export function removeLiquidityIx(
+  ctx: SwapContext,
+  pool: PublicKey,
+  reserveACt: PublicKey,
+  reserveBCt: PublicKey,
+  shareBpsCt: PublicKey,
+  amountAOutCt: PublicKey,
+  amountBOutCt: PublicKey,
+): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: ctx.programId,
+    data: Buffer.from([4, ctx.cpiBump]),
+    keys: [
+      { pubkey: pool, isSigner: false, isWritable: false },
+      { pubkey: reserveACt, isSigner: false, isWritable: true },
+      { pubkey: reserveBCt, isSigner: false, isWritable: true },
+      { pubkey: shareBpsCt, isSigner: false, isWritable: true },
+      { pubkey: amountAOutCt, isSigner: false, isWritable: true },
+      { pubkey: amountBOutCt, isSigner: false, isWritable: true },
+      ...encryptCpiAccounts(ctx.enc, ctx.programId, ctx.cpiAuthority, ctx.payer),
+    ],
+  });
+}
+
 /** Instruction 2: AddLiquidity */
 export function addLiquidityIx(
   ctx: SwapContext,
