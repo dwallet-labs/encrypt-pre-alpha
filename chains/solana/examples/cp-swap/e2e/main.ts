@@ -135,10 +135,11 @@ async function main() {
   const [poolPda, poolBump] = derivePoolPda(SWAP_PROGRAM, mintA, mintB);
   const rACt = Keypair.generate();
   const rBCt = Keypair.generate();
+  const tsCt = Keypair.generate();
 
   await sendTx(connection, payer, [
-    createPoolIx(ctx, poolPda, poolBump, mintA, mintB, rACt.publicKey, rBCt.publicKey),
-  ], [rACt, rBCt]);
+    createPoolIx(ctx, poolPda, poolBump, mintA, mintB, rACt.publicKey, rBCt.publicKey, tsCt.publicKey),
+  ], [rACt, rBCt, tsCt]);
   ok(`Pool: ${poolPda.toBase58()}`);
 
   // ═══════════════════════════════════════════
@@ -147,21 +148,27 @@ async function main() {
   log("2/8", "Adding liquidity: 10,000 cpUSDC + 100 cpSOL...");
   const liqA = await enc(grpc, 10_000n, networkKey);
   const liqB = await enc(grpc, 100n, networkKey);
+  const lpMintedCt = await enc(grpc, 0n, networkKey);
   await sendTx(connection, payer, [
-    addLiquidityIx(ctx, poolPda, rACt.publicKey, rBCt.publicKey, liqA, liqB),
+    addLiquidityIx(ctx, poolPda, rACt.publicKey, rBCt.publicKey, tsCt.publicKey, liqA, liqB, lpMintedCt),
   ]);
   await pollUntil(connection, rACt.publicKey, isVerified, 120_000);
   await pollUntil(connection, rBCt.publicKey, isVerified, 120_000);
+  await pollUntil(connection, tsCt.publicKey, isVerified, 120_000);
   ok("Liquidity added");
 
   // ═══════════════════════════════════════════
   // 3. Decrypt reserves
   // ═══════════════════════════════════════════
-  log("3/8", "Decrypting reserves...");
+  log("3/8", "Decrypting reserves + LP...");
   let ra = await decrypt(ctx, rACt.publicKey);
   let rb = await decrypt(ctx, rBCt.publicKey);
+  let supply = await decrypt(ctx, tsCt.publicKey);
+  let lpMinted = await decrypt(ctx, lpMintedCt);
   val("Reserve A (cpUSDC)", ra);
   val("Reserve B (cpSOL)", rb);
+  val("LP minted", lpMinted);
+  val("Total LP supply", supply);
   val("k = A × B", ra * rb);
 
   // ═══════════════════════════════════════════
@@ -232,24 +239,30 @@ async function main() {
   // ═══════════════════════════════════════════
   // 7. Remove 25% liquidity
   // ═══════════════════════════════════════════
-  log("7/8", "Removing 25% liquidity...");
-  const shareCt = await enc(grpc, 2500n, networkKey); // 2500 bps = 25%
+  log("7/8", "Removing 25% of LP tokens...");
+  supply = await decrypt(ctx, tsCt.publicKey);
+  const burnAmount = supply / 4n; // 25%
+  val("Burning LP", burnAmount);
+  const burnCt = await enc(grpc, burnAmount, networkKey);
   const rmAOut = await enc(grpc, 0n, networkKey);
   const rmBOut = await enc(grpc, 0n, networkKey);
 
   await sendTx(connection, payer, [
-    removeLiquidityIx(ctx, poolPda, rACt.publicKey, rBCt.publicKey, shareCt, rmAOut, rmBOut),
+    removeLiquidityIx(ctx, poolPda, rACt.publicKey, rBCt.publicKey, tsCt.publicKey, burnCt, rmAOut, rmBOut),
   ]);
   await pollUntil(connection, rACt.publicKey, isVerified, 120_000);
   await pollUntil(connection, rBCt.publicKey, isVerified, 120_000);
+  await pollUntil(connection, tsCt.publicKey, isVerified, 120_000);
 
   const withdrawnA = await decrypt(ctx, rmAOut);
   const withdrawnB = await decrypt(ctx, rmBOut);
   ra = await decrypt(ctx, rACt.publicKey);
   rb = await decrypt(ctx, rBCt.publicKey);
+  supply = await decrypt(ctx, tsCt.publicKey);
   ok(`Withdrew: ${withdrawnA} cpUSDC + ${withdrawnB} cpSOL`);
   val("Reserve A (cpUSDC)", ra);
   val("Reserve B (cpSOL)", rb);
+  val("Remaining LP supply", supply);
 
   // ═══════════════════════════════════════════
   // 8. Summary
