@@ -423,16 +423,16 @@ fn initialize_mint(
     if !authority.is_signer() || !payer.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    // bump(1) + decimals(1) + mint_authority(32) + freeze_flag(1) = 35 min
-    if data.len() < 35 {
+    // bump(1) + decimals(1) + mint_authority(32) = 34 min (freeze_flag adds 1 more)
+    if data.len() < 34 {
         return Err(ProgramError::InvalidInstructionData);
     }
 
     let bump = data[0];
     let decimals = data[1];
     let mint_authority: [u8; 32] = data[2..34].try_into().unwrap();
-    let has_freeze = data[34] != 0;
-    let freeze_authority: [u8; 32] = if has_freeze && data.len() >= 67 {
+    let has_freeze = data.len() > 34 && data[34] != 0;
+    let freeze_authority: [u8; 32] = if has_freeze && data.len() >= 66 {
         data[35..67].try_into().unwrap()
     } else {
         [0u8; 32]

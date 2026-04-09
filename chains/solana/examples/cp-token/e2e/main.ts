@@ -16,18 +16,24 @@ import {
   Keypair,
   PublicKey,
 } from "@solana/web3.js";
+import * as fs from "fs";
 
-import { setupEncrypt } from "../../../_shared/encrypt-setup.ts";
+import {
+  setupEncrypt,
+  encryptCpiAccounts,
+  type EncryptAccounts,
+} from "../../_shared/encrypt-setup.ts";
 import {
   log,
   ok,
   val,
   sendTx,
+  pda,
   pollUntil,
   isVerified,
   isDecrypted,
   mockCiphertext,
-} from "../../../_shared/helpers.ts";
+} from "../../_shared/helpers.ts";
 import { createEncryptClient, Chain } from "../../../clients/typescript/src/grpc.ts";
 import {
   deriveCpTokenPdas,
@@ -53,20 +59,91 @@ if (!encryptArg || !cpTokenArg) {
 const ENCRYPT_PROGRAM = new PublicKey(encryptArg);
 const CP_TOKEN_PROGRAM = new PublicKey(cpTokenArg);
 const connection = new Connection(RPC_URL, "confirmed");
-const payer = Keypair.generate();
+
+// Load local keypair (solana config keypair) or generate one
+const KEYPAIR_PATH = process.env.KEYPAIR_PATH ?? `${process.env.HOME}/.config/solana/devnet-admin.json`;
+const payer = (() => {
+  try {
+    const raw = JSON.parse(fs.readFileSync(KEYPAIR_PATH, "utf-8"));
+    return Keypair.fromSecretKey(Uint8Array.from(raw));
+  } catch {
+    return Keypair.generate();
+  }
+})();
 
 async function main() {
   console.log("\n\x1b[1m═══ CP-Token E2E Demo ═══\x1b[0m\n");
   console.log("  Confidential token: all balances and amounts are encrypted\n");
 
   // ── Setup ──
-  const { accounts: enc, encrypt } = await setupEncrypt(
-    connection,
-    payer,
+  // Setup encrypt accounts (inline — avoids setupEncrypt's 100 SOL airdrop
+  // which fails on devnet rate limits when using a pre-funded keypair)
+  const grpc = createEncryptClient();
+  log("Setup", `Connected to executor gRPC`);
+  log("Setup", `Payer: ${payer.publicKey.toBase58()}`);
+
+  const bal = await connection.getBalance(payer.publicKey);
+  ok(`Balance: ${bal / 1e9} SOL`);
+  if (bal < 1e9) {
+    log("Setup", "Airdropping SOL...");
+    const sig = await connection.requestAirdrop(payer.publicKey, 2e9);
+    await connection.confirmTransaction(sig);
+  }
+
+  const [configPda] = pda([Buffer.from("encrypt_config")], ENCRYPT_PROGRAM);
+  const [eventAuthority] = pda([Buffer.from("__event_authority")], ENCRYPT_PROGRAM);
+  const [depositPda, depositBump] = pda(
+    [Buffer.from("encrypt_deposit"), payer.publicKey.toBuffer()],
+    ENCRYPT_PROGRAM
+  );
+  const networkKey = Buffer.alloc(32, 0x55);
+  const [networkKeyPda] = pda(
+    [Buffer.from("network_encryption_key"), networkKey],
     ENCRYPT_PROGRAM
   );
 
-  const grpc = createEncryptClient();
+  // Create deposit if needed
+  const depositInfo = await connection.getAccountInfo(depositPda);
+  if (!depositInfo) {
+    log("Setup", "Creating deposit...");
+    const configInfo = await connection.getAccountInfo(configPda);
+    if (!configInfo) throw new Error("Encrypt config not initialized");
+    const encVault = new PublicKey((configInfo.data as Buffer).subarray(100, 132));
+    const vaultPk = encVault.equals(PublicKey.default) ? payer.publicKey : encVault;
+
+    const depositData = Buffer.alloc(18);
+    depositData[0] = 14;
+    depositData[1] = depositBump;
+
+    await sendTx(connection, payer, [
+      new (await import("@solana/web3.js")).TransactionInstruction({
+        programId: ENCRYPT_PROGRAM,
+        data: depositData,
+        keys: [
+          { pubkey: depositPda, isSigner: false, isWritable: true },
+          { pubkey: configPda, isSigner: false, isWritable: false },
+          { pubkey: payer.publicKey, isSigner: true, isWritable: false },
+          { pubkey: payer.publicKey, isSigner: true, isWritable: true },
+          { pubkey: payer.publicKey, isSigner: true, isWritable: true },
+          { pubkey: vaultPk, isSigner: vaultPk.equals(payer.publicKey), isWritable: true },
+          { pubkey: PublicKey.default, isSigner: false, isWritable: false },
+          { pubkey: PublicKey.default, isSigner: false, isWritable: false },
+        ],
+      }),
+    ]);
+    ok("Deposit created");
+  } else {
+    ok("Deposit already exists");
+  }
+
+  const enc: EncryptAccounts = {
+    encryptProgram: ENCRYPT_PROGRAM,
+    configPda,
+    eventAuthority,
+    depositPda,
+    networkKeyPda,
+    networkKey,
+  };
   const { cpiAuthority, cpiBump } = deriveCpTokenPdas(CP_TOKEN_PROGRAM, payer.publicKey);
 
   const ctx = {
@@ -79,11 +156,12 @@ async function main() {
 
   // ── 1. Create Mint ──
   log("1/8", "Creating confidential token mint (6 decimals)...");
-  const [mintPda, mintBump] = deriveMintPda(CP_TOKEN_PROGRAM, payer.publicKey);
+  const mintAuthority = Keypair.generate();
+  const [mintPda, mintBump] = deriveMintPda(CP_TOKEN_PROGRAM, mintAuthority.publicKey);
 
   await sendTx(connection, payer, [
-    initializeMintIx(ctx, mintPda, mintBump, 6, payer.publicKey),
-  ]);
+    initializeMintIx(ctx, mintPda, mintBump, 6, mintAuthority.publicKey),
+  ], [mintAuthority]);
   ok(`Mint: ${mintPda.toBase58()}`);
 
   // ── 2. Create Token Accounts ──
@@ -91,10 +169,6 @@ async function main() {
 
   const alice = Keypair.generate();
   const bob = Keypair.generate();
-  const airdropA = await connection.requestAirdrop(alice.publicKey, 1e9);
-  const airdropB = await connection.requestAirdrop(bob.publicKey, 1e9);
-  await connection.confirmTransaction(airdropA);
-  await connection.confirmTransaction(airdropB);
 
   const [aliceAccount, aliceBump] = deriveAccountPda(CP_TOKEN_PROGRAM, mintPda, alice.publicKey);
   const [bobAccount, bobBump] = deriveAccountPda(CP_TOKEN_PROGRAM, mintPda, bob.publicKey);
@@ -128,8 +202,8 @@ async function main() {
   ok(`Mint amount CT: ${mintAmountCt.toBase58()} (encrypted via gRPC)`);
 
   await sendTx(connection, payer, [
-    mintToIx(ctx, mintPda, aliceAccount, aliceBalanceCt.publicKey, mintAmountCt, payer.publicKey),
-  ]);
+    mintToIx(ctx, mintPda, aliceAccount, aliceBalanceCt.publicKey, mintAmountCt, mintAuthority.publicKey),
+  ], [mintAuthority]);
   ok("MintTo instruction sent — waiting for executor...");
 
   await pollUntil(connection, aliceBalanceCt.publicKey, isVerified, 120_000);
@@ -163,6 +237,16 @@ async function main() {
 
   await pollUntil(connection, aliceBalanceCt.publicKey, isVerified, 120_000);
   ok("Executor committed graph outputs");
+
+  // Fund Alice and Bob for decrypt rent (they're owners/payers in CPI)
+  const { SystemProgram, Transaction } = await import("@solana/web3.js");
+  const fundTx = new Transaction().add(
+    SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: alice.publicKey, lamports: 0.05e9 }),
+    SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: bob.publicKey, lamports: 0.05e9 }),
+  );
+  const { sendAndConfirmTransaction } = await import("@solana/web3.js");
+  await sendAndConfirmTransaction(connection, fundTx, [payer]);
+  ok("Funded Alice and Bob for decrypt rent");
 
   // ── 5. Decrypt Alice's balance ──
   log("5/8", "Alice requests balance decryption...");
@@ -233,7 +317,6 @@ async function main() {
     console.log(`    Bob:   expected ${expectedBob}, got ${bobBalance}\n`);
   }
 
-  encrypt.close();
   grpc.close();
 }
 
