@@ -12,6 +12,7 @@ encrypt-dsl = { package = "encrypt-solana-dsl", path = "../../../program-sdk/dsl
 encrypt-pinocchio = { workspace = true }
 pinocchio = { workspace = true }
 pinocchio-system = { workspace = true }
+pinocchio-token = { workspace = true }
 
 [dev-dependencies]
 encrypt-solana-test = { workspace = true }

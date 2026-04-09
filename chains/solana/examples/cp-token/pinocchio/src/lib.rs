@@ -65,6 +65,7 @@ use pinocchio::{
     AccountView, Address, ProgramResult,
 };
 use pinocchio_system::instructions::CreateAccount;
+use pinocchio_token::instructions::Transfer as SplTransfer;
 
 entrypoint!(process_instruction);
 
@@ -230,6 +231,78 @@ impl TokenAccount {
     }
 }
 
+/// Vault — links a CP-Token mint to an SPL mint for wrapping/unwrapping.
+/// PDA seeds: `["cp_vault", cp_mint]`
+///
+/// The vault PDA is the authority/owner of the SPL token account that holds
+/// locked tokens. When users wrap, SPL tokens are transferred into this
+/// account. When they unwrap, tokens are released from it.
+#[repr(C)]
+pub struct Vault {
+    /// The SPL mint being wrapped (e.g., USDC mint address).
+    pub spl_mint: [u8; 32],
+    /// PDA bump seed.
+    pub bump: u8,
+}
+
+impl Vault {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+
+    pub fn from_bytes(data: &[u8]) -> Result<&Self, ProgramError> {
+        if data.len() < Self::LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(unsafe { &*(data.as_ptr() as *const Self) })
+    }
+
+    pub fn from_bytes_mut(data: &mut [u8]) -> Result<&mut Self, ProgramError> {
+        if data.len() < Self::LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(unsafe { &mut *(data.as_mut_ptr() as *mut Self) })
+    }
+}
+
+/// WithdrawalReceipt — tracks a pending unwrap operation.
+/// PDA seeds: `["cp_receipt", withdrawn_ct]`
+///
+/// Created during unwrap_init, consumed during unwrap_complete.
+/// Stores the requested amount so we can verify the decrypted burned
+/// amount matches before releasing SPL tokens.
+#[repr(C)]
+pub struct WithdrawalReceipt {
+    /// Owner who initiated the unwrap.
+    pub owner: [u8; 32],
+    /// Requested plaintext withdrawal amount.
+    pub amount: [u8; 8],
+    /// Digest for verifying the decryption result.
+    pub pending_digest: [u8; 32],
+    /// PDA bump seed.
+    pub bump: u8,
+}
+
+impl WithdrawalReceipt {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+
+    pub fn from_bytes(data: &[u8]) -> Result<&Self, ProgramError> {
+        if data.len() < Self::LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(unsafe { &*(data.as_ptr() as *const Self) })
+    }
+
+    pub fn from_bytes_mut(data: &mut [u8]) -> Result<&mut Self, ProgramError> {
+        if data.len() < Self::LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(unsafe { &mut *(data.as_mut_ptr() as *mut Self) })
+    }
+
+    pub fn requested_amount(&self) -> u64 {
+        u64::from_le_bytes(self.amount)
+    }
+}
+
 // ── Rent helper ──
 
 fn minimum_balance(size: usize) -> u64 {
@@ -290,6 +363,18 @@ fn transfer_from_graph(
     (new_from, new_to, new_allowance)
 }
 
+/// Unwrap: conditional burn that outputs the actual burned amount.
+/// Returns (new_balance, withdrawn) where withdrawn = amount on success,
+/// 0 on failure. `amount - amount` is always 0 in FHE — exploits the
+/// identity property to derive an encrypted zero without a constant.
+#[encrypt_fn]
+fn unwrap_graph(balance: EUint64, amount: EUint64) -> (EUint64, EUint64) {
+    let sufficient = balance >= amount;
+    let new_balance = if sufficient { balance - amount } else { balance };
+    let withdrawn = if sufficient { amount } else { amount - amount };
+    (new_balance, withdrawn)
+}
+
 // ── Instruction dispatch — P-Token discriminators ──
 
 fn process_instruction(
@@ -313,6 +398,12 @@ fn process_instruction(
         Some((&20, rest)) => transfer_from(accounts, rest),
         Some((&21, rest)) => request_decrypt(accounts, rest),
         Some((&22, _rest)) => reveal_balance(accounts),
+        // Wrap/unwrap (SPL ↔ CP-Token bridge)
+        Some((&23, rest)) => initialize_vault(program_id, accounts, rest),
+        Some((&30, rest)) => wrap(accounts, rest),
+        Some((&31, rest)) => unwrap_init(program_id, accounts, rest),
+        Some((&32, rest)) => unwrap_decrypt(accounts, rest),
+        Some((&33, _rest)) => unwrap_complete(accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -1130,6 +1221,372 @@ fn reveal_balance(accounts: &[AccountView]) -> ProgramResult {
     Ok(())
 }
 
+// ── 23: InitializeVault ──
+// data: vault_bump(1)
+// accounts: [vault_pda(w), cp_mint, spl_mint, payer(s,w), system_program]
+//
+// Creates a vault linking a CP-Token mint to an SPL mint.
+// The vault PDA becomes the authority of the SPL token account.
+
+fn initialize_vault(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    let [vault_acct, cp_mint_acct, _spl_mint, payer, _system_program, ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if !payer.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let vault_bump = data[0];
+
+    // Verify CP mint is initialized
+    let mint_data = unsafe { cp_mint_acct.borrow_unchecked() };
+    let mint = Mint::from_bytes(mint_data)?;
+    if !mint.is_initialized() {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    // Create vault PDA
+    let bump_byte = [vault_bump];
+    let seeds = [
+        Seed::from(b"cp_vault" as &[u8]),
+        Seed::from(cp_mint_acct.address().as_ref()),
+        Seed::from(&bump_byte),
+    ];
+    let signer = [Signer::from(&seeds)];
+
+    CreateAccount {
+        from: payer,
+        to: vault_acct,
+        lamports: minimum_balance(Vault::LEN),
+        space: Vault::LEN as u64,
+        owner: program_id,
+    }
+    .invoke_signed(&signer)?;
+
+    let d = unsafe { vault_acct.borrow_unchecked_mut() };
+    let vault = Vault::from_bytes_mut(d)?;
+    vault.spl_mint.copy_from_slice(_spl_mint.address().as_ref());
+    vault.bump = vault_bump;
+    Ok(())
+}
+
+// ── 30: Wrap ──
+// data: cpi_authority_bump(1) | amount(8, LE)
+// accounts: [vault, token_account, user_ata(w), vault_ata(w),
+//            balance_ct(w), amount_ct(w,s),
+//            encrypt_program, config, deposit(w), cpi_authority,
+//            caller_program, network_encryption_key, owner(s,w),
+//            event_authority, system_program,
+//            spl_token_program]
+//
+// Wraps SPL tokens into confidential CP-Tokens.
+// Amount is plaintext — the SPL deposit is visible on-chain anyway.
+// Privacy begins after wrapping: all cpToken operations are encrypted.
+
+fn wrap(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [vault_acct, token_acct, user_ata, vault_ata, balance_ct, amount_ct, encrypt_program, config, deposit, cpi_authority, caller_program, network_encryption_key, owner, event_authority, system_program, _spl_token_program, ..] =
+        accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if !owner.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if data.len() < 9 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let cpi_authority_bump = data[0];
+    let amount = u64::from_le_bytes(data[1..9].try_into().unwrap());
+    if amount == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Verify token account
+    let ta_data = unsafe { token_acct.borrow_unchecked() };
+    let ta = TokenAccount::from_bytes(ta_data)?;
+    if !ta.is_initialized() {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    assert_not_frozen(ta)?;
+    if owner.address().as_array() != &ta.owner {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if balance_ct.address().as_array() != ta.balance.id() {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Verify vault matches this mint
+    let vault_data = unsafe { vault_acct.borrow_unchecked() };
+    let _vault = Vault::from_bytes(vault_data)?;
+
+    // 1. SPL transfer: user_ata → vault_ata
+    SplTransfer {
+        from: user_ata,
+        to: vault_ata,
+        authority: owner,
+        amount,
+    }
+    .invoke()?;
+
+    // 2. Create plaintext amount ciphertext + add to encrypted balance
+    let ctx = EncryptContext {
+        encrypt_program,
+        config,
+        deposit,
+        cpi_authority,
+        caller_program,
+        network_encryption_key,
+        payer: owner,
+        event_authority,
+        system_program,
+        cpi_authority_bump,
+    };
+
+    ctx.create_plaintext_typed::<Uint64>(&amount, amount_ct)?;
+    ctx.mint_to_graph(balance_ct, amount_ct, balance_ct)?;
+
+    Ok(())
+}
+
+// ── 31: UnwrapInit ──
+// data: receipt_bump(1) | cpi_authority_bump(1) | amount(8, LE)
+// accounts: [vault, token_account, receipt_pda(w),
+//            balance_ct(w), amount_ct(w,s), withdrawn_ct(w,s),
+//            encrypt_program, config, deposit(w), cpi_authority,
+//            caller_program, network_encryption_key, owner(s,w),
+//            event_authority, system_program]
+//
+// First step of unwrap: creates amount ciphertext, runs unwrap_graph to
+// conditionally burn and produce a withdrawn receipt ciphertext.
+
+fn unwrap_init(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    let [_vault_acct, token_acct, receipt_acct, balance_ct, amount_ct, withdrawn_ct, encrypt_program, config, deposit, cpi_authority, caller_program, network_encryption_key, owner, event_authority, system_program, ..] =
+        accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if !owner.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if data.len() < 10 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let receipt_bump = data[0];
+    let cpi_authority_bump = data[1];
+    let amount = u64::from_le_bytes(data[2..10].try_into().unwrap());
+    if amount == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Verify token account
+    let ta_data = unsafe { token_acct.borrow_unchecked() };
+    let ta = TokenAccount::from_bytes(ta_data)?;
+    if !ta.is_initialized() {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    assert_not_frozen(ta)?;
+    if owner.address().as_array() != &ta.owner {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if balance_ct.address().as_array() != ta.balance.id() {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Create receipt PDA
+    let bump_byte = [receipt_bump];
+    let seeds = [
+        Seed::from(b"cp_receipt" as &[u8]),
+        Seed::from(withdrawn_ct.address().as_ref()),
+        Seed::from(&bump_byte),
+    ];
+    let signer = [Signer::from(&seeds)];
+
+    CreateAccount {
+        from: owner,
+        to: receipt_acct,
+        lamports: minimum_balance(WithdrawalReceipt::LEN),
+        space: WithdrawalReceipt::LEN as u64,
+        owner: program_id,
+    }
+    .invoke_signed(&signer)?;
+
+    let ctx = EncryptContext {
+        encrypt_program,
+        config,
+        deposit,
+        cpi_authority,
+        caller_program,
+        network_encryption_key,
+        payer: owner,
+        event_authority,
+        system_program,
+        cpi_authority_bump,
+    };
+
+    // Create amount ciphertext (plaintext — withdrawal amount is public)
+    ctx.create_plaintext_typed::<Uint64>(&amount, amount_ct)?;
+
+    // Create zero ciphertext for withdrawn output
+    ctx.create_plaintext_typed::<Uint64>(&0u64, withdrawn_ct)?;
+
+    // Execute unwrap_graph: (new_balance, withdrawn) = unwrap(balance, amount)
+    ctx.unwrap_graph(balance_ct, amount_ct, balance_ct, withdrawn_ct)?;
+
+    // Write receipt
+    let rd = unsafe { receipt_acct.borrow_unchecked_mut() };
+    let receipt = WithdrawalReceipt::from_bytes_mut(rd)?;
+    receipt.owner.copy_from_slice(owner.address().as_ref());
+    receipt.amount = amount.to_le_bytes();
+    receipt.pending_digest = [0u8; 32];
+    receipt.bump = receipt_bump;
+
+    Ok(())
+}
+
+// ── 32: UnwrapDecrypt ──
+// data: cpi_authority_bump(1)
+// accounts: [receipt(w), request_acct(w,s), withdrawn_ct,
+//            encrypt_program, config, deposit(w), cpi_authority,
+//            caller_program, network_encryption_key, owner(s,w),
+//            event_authority, system_program]
+
+fn unwrap_decrypt(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [receipt_acct, request_acct, withdrawn_ct, encrypt_program, config, deposit, cpi_authority, caller_program, network_encryption_key, owner, event_authority, system_program, ..] =
+        accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if !owner.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let cpi_authority_bump = data[0];
+
+    // Verify receipt owner
+    let rd = unsafe { receipt_acct.borrow_unchecked() };
+    let receipt = WithdrawalReceipt::from_bytes(rd)?;
+    if owner.address().as_array() != &receipt.owner {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let ctx = EncryptContext {
+        encrypt_program,
+        config,
+        deposit,
+        cpi_authority,
+        caller_program,
+        network_encryption_key,
+        payer: owner,
+        event_authority,
+        system_program,
+        cpi_authority_bump,
+    };
+
+    let digest = ctx.request_decryption(request_acct, withdrawn_ct)?;
+
+    let rd_mut = unsafe { receipt_acct.borrow_unchecked_mut() };
+    let receipt_mut = WithdrawalReceipt::from_bytes_mut(rd_mut)?;
+    receipt_mut.pending_digest = digest;
+
+    Ok(())
+}
+
+// ── 33: UnwrapComplete ──
+// data: (none)
+// accounts: [receipt(w), vault, cp_mint, request_acct,
+//            vault_ata(w), user_ata(w), owner(s),
+//            destination(w), spl_token_program]
+//
+// Final step: reads decrypted withdrawn amount, verifies it matches the
+// requested amount, then SPL-transfers from vault to user.
+// Closes the receipt PDA and returns rent to destination.
+
+fn unwrap_complete(accounts: &[AccountView]) -> ProgramResult {
+    let [receipt_acct, vault_acct, cp_mint_acct, request_acct, vault_ata, user_ata, owner, destination, _spl_token_program, ..] =
+        accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if !owner.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Read receipt
+    let rd = unsafe { receipt_acct.borrow_unchecked() };
+    let receipt = WithdrawalReceipt::from_bytes(rd)?;
+    if owner.address().as_array() != &receipt.owner {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let requested_amount = receipt.requested_amount();
+    let pending_digest = receipt.pending_digest;
+
+    // Read and verify decrypted withdrawn amount
+    let req_data = unsafe { request_acct.borrow_unchecked() };
+    let withdrawn: &u64 =
+        accounts::read_decrypted_verified::<Uint64>(req_data, &pending_digest)?;
+
+    if *withdrawn != requested_amount {
+        // Withdrawn == 0 means insufficient balance — no SPL transfer
+        // Close receipt and return rent, but don't release tokens
+        let receipt_lamports = receipt_acct.lamports();
+        receipt_acct.set_lamports(0);
+        destination.set_lamports(destination.lamports() + receipt_lamports);
+        let rd_mut = unsafe { receipt_acct.borrow_unchecked_mut() };
+        for byte in rd_mut.iter_mut() {
+            *byte = 0;
+        }
+        return Ok(());
+    }
+
+    // SPL transfer: vault → user (signed by vault PDA)
+    let vault_data = unsafe { vault_acct.borrow_unchecked() };
+    let vault = Vault::from_bytes(vault_data)?;
+    let _ = vault; // validate it parses
+
+    let vault_bump_byte = [vault.bump];
+    let vault_seeds = [
+        Seed::from(b"cp_vault" as &[u8]),
+        Seed::from(cp_mint_acct.address().as_ref()),
+        Seed::from(&vault_bump_byte),
+    ];
+    let vault_signer = [Signer::from(&vault_seeds)];
+
+    SplTransfer {
+        from: vault_ata,
+        to: user_ata,
+        authority: vault_acct,
+        amount: requested_amount,
+    }
+    .invoke_signed(&vault_signer)?;
+
+    // Close receipt PDA — return rent to destination
+    let receipt_lamports = receipt_acct.lamports();
+    receipt_acct.set_lamports(0);
+    destination.set_lamports(destination.lamports() + receipt_lamports);
+    let rd_mut = unsafe { receipt_acct.borrow_unchecked_mut() };
+    for byte in rd_mut.iter_mut() {
+        *byte = 0;
+    }
+
+    Ok(())
+}
+
 // ── Tests ──
 
 #[cfg(test)]
@@ -1138,7 +1595,7 @@ mod tests {
     use encrypt_types::identifier::*;
     use encrypt_types::types::FheType;
 
-    use super::{burn_graph, mint_to_graph, transfer_from_graph, transfer_graph};
+    use super::{burn_graph, mint_to_graph, transfer_from_graph, transfer_graph, unwrap_graph};
 
     fn run_mock(graph_fn: fn() -> Vec<u8>, inputs: &[u128], fhe_types: &[FheType]) -> Vec<u128> {
         let data = graph_fn();
@@ -1335,5 +1792,45 @@ mod tests {
         let pg = parse_graph(&g).unwrap();
         assert_eq!(pg.header().num_inputs(), 4);
         assert_eq!(pg.header().num_outputs(), 3);
+
+        let g = unwrap_graph();
+        let pg = parse_graph(&g).unwrap();
+        assert_eq!(pg.header().num_inputs(), 2);
+        assert_eq!(pg.header().num_outputs(), 2);
+    }
+
+    // ── unwrap_graph tests ──
+
+    #[test]
+    fn unwrap_sufficient() {
+        let r = run_mock(
+            unwrap_graph,
+            &[1000, 300],
+            &[FheType::EUint64, FheType::EUint64],
+        );
+        assert_eq!(r[0], 700, "balance: 1000 - 300");
+        assert_eq!(r[1], 300, "withdrawn: amount on success");
+    }
+
+    #[test]
+    fn unwrap_insufficient() {
+        let r = run_mock(
+            unwrap_graph,
+            &[100, 300],
+            &[FheType::EUint64, FheType::EUint64],
+        );
+        assert_eq!(r[0], 100, "balance unchanged");
+        assert_eq!(r[1], 0, "withdrawn: 0 on failure");
+    }
+
+    #[test]
+    fn unwrap_exact() {
+        let r = run_mock(
+            unwrap_graph,
+            &[500, 500],
+            &[FheType::EUint64, FheType::EUint64],
+        );
+        assert_eq!(r[0], 0, "balance: 500 - 500 = 0");
+        assert_eq!(r[1], 500, "withdrawn: exact amount");
     }
 }
