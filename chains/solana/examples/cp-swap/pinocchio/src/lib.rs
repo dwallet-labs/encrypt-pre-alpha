@@ -29,7 +29,7 @@
 /// 1. `Swap` — swap token A for token B (or vice versa)
 use encrypt_dsl::prelude::encrypt_fn;
 use encrypt_pinocchio::EncryptContext;
-use encrypt_types::encrypted::{EUint128, Uint128};
+use encrypt_types::encrypted::Uint128;
 use pinocchio::{
     cpi::{Seed, Signer},
     entrypoint,
