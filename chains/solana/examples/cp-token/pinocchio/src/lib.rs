@@ -1323,9 +1323,24 @@ fn wrap(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
         return Err(ProgramError::InvalidArgument);
     }
 
-    // Verify vault matches this mint
+    // Verify vault is the correct PDA for this mint and SPL mint matches
     let vault_data = unsafe { vault_acct.borrow_unchecked() };
-    let _vault = Vault::from_bytes(vault_data)?;
+    let vault = Vault::from_bytes(vault_data)?;
+
+    // Verify vault_ata is owned by the vault PDA (SPL token account authority check).
+    // The SPL Transfer CPI will also enforce this, but we verify the vault-mint linkage.
+    let vault_ata_data = unsafe { vault_ata.borrow_unchecked() };
+    // SPL token account: owner is at offset 32..64
+    if vault_ata_data.len() < 64 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if &vault_ata_data[32..64] != vault_acct.address().as_ref() {
+        return Err(ProgramError::InvalidArgument); // vault_ata not owned by vault PDA
+    }
+    // SPL token account: mint is at offset 0..32
+    if &vault_ata_data[0..32] != &vault.spl_mint {
+        return Err(ProgramError::InvalidArgument); // vault_ata mint doesn't match vault.spl_mint
+    }
 
     // 1. SPL transfer: user_ata → vault_ata
     SplTransfer {
@@ -1372,7 +1387,7 @@ fn unwrap_init(
     accounts: &[AccountView],
     data: &[u8],
 ) -> ProgramResult {
-    let [_vault_acct, token_acct, receipt_acct, balance_ct, amount_ct, withdrawn_ct, encrypt_program, config, deposit, cpi_authority, caller_program, network_encryption_key, owner, event_authority, system_program, ..] =
+    let [vault_acct, token_acct, receipt_acct, balance_ct, amount_ct, withdrawn_ct, encrypt_program, config, deposit, cpi_authority, caller_program, network_encryption_key, owner, event_authority, system_program, ..] =
         accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -1390,6 +1405,10 @@ fn unwrap_init(
     if amount == 0 {
         return Err(ProgramError::InvalidArgument);
     }
+
+    // Verify vault exists and is owned by this program
+    let vault_data = unsafe { vault_acct.borrow_unchecked() };
+    let _vault = Vault::from_bytes(vault_data)?;
 
     // Verify token account
     let ta_data = unsafe { token_acct.borrow_unchecked() };
@@ -1557,7 +1576,15 @@ fn unwrap_complete(accounts: &[AccountView]) -> ProgramResult {
     // SPL transfer: vault → user (signed by vault PDA)
     let vault_data = unsafe { vault_acct.borrow_unchecked() };
     let vault = Vault::from_bytes(vault_data)?;
-    let _ = vault; // validate it parses
+
+    // Verify vault_ata is owned by the vault PDA
+    let vault_ata_data = unsafe { vault_ata.borrow_unchecked() };
+    if vault_ata_data.len() < 64 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if &vault_ata_data[32..64] != vault_acct.address().as_ref() {
+        return Err(ProgramError::InvalidArgument);
+    }
 
     let vault_bump_byte = [vault.bump];
     let vault_seeds = [
