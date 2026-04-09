@@ -25,6 +25,7 @@ members = [
     "chains/solana/examples/acl/native",
     "chains/solana/examples/acl/anchor",
     "chains/solana/examples/cp-token/pinocchio",
+    "chains/solana/examples/cp-swap/pinocchio",
     "chains/solana/examples/coin-flip/pinocchio",
     "chains/solana/examples/coin-flip/native",
     "chains/solana/examples/coin-flip/anchor",
