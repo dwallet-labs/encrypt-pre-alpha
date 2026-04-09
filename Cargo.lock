@@ -1752,6 +1752,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cp-token"
+version = "0.1.0"
+dependencies = [
+ "encrypt-pinocchio",
+ "encrypt-solana-dsl",
+ "encrypt-solana-test",
+ "encrypt-types",
+ "mollusk-svm",
+ "pinocchio",
+ "pinocchio-system",
+ "solana-account 3.4.0",
+ "solana-instruction",
+ "solana-pubkey 4.1.0",
+ "solana-sdk",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

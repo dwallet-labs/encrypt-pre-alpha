@@ -66,6 +66,9 @@
 - [Encrypted ACL](./examples/acl/01-overview.md)
     - [Building the Program](./examples/acl/02-program.md)
     - [Testing](./examples/acl/03-testing.md)
+- [CP-Token](./examples/cp-token/01-overview.md)
+    - [Building the Program](./examples/cp-token/02-program.md)
+    - [Testing](./examples/cp-token/03-testing.md)
 
 # Reference
 

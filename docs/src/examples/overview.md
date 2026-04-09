@@ -34,3 +34,9 @@ Encrypted voting where individual votes are hidden but the tally is computed via
 An on-chain access control list where permissions are stored as encrypted 64-bit bitmasks. Grant, revoke, and check operations use FHE bitwise operations (OR, AND). Nobody can see what permissions are set.
 
 **Covers:** Multiple FHE graphs in one program, inverse mask pattern for revocation, separate state accounts with independent decryption flows, admin-gated vs public operations.
+
+## CP-Token (Confidential Performant Token)
+
+A composable confidential token program — Anza's [P-Token](https://github.com/anza-xyz/pinocchio/tree/main/programs/token) architecture rebuilt with Encrypt FHE. All balances and transfer amounts are encrypted; nobody can see how many tokens any account holds or how much is being transferred. Follows P-Token's COption flags, AccountState enum, instruction discriminators, and freeze/thaw patterns.
+
+**Covers:** Encrypted balances (EUint64), client-encrypted transfer amounts, conditional FHE logic (insufficient funds → silent no-op), approve/transfer_from delegation for composability, freeze/thaw/close, balance decryption flow. Demonstrates how existing Solana token standards can be made confidential with Encrypt.
