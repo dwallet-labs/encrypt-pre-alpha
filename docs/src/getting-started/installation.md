@@ -74,6 +74,6 @@ The Encrypt program is deployed to **Solana devnet**. An executor is running at:
 |----------|----------|
 | **Encrypt gRPC** | `https://pre-alpha-dev-1.encrypt.ika-network.net:443` |
 | **Solana RPC** | `https://api.devnet.solana.com` |
-| **Program ID** | `TODO: will be updated after deployment` |
+| **Program ID** | `4ebfzWdKnrnGseuQpezXdG8yCdHqwQ1SSBHD3bWArND8` |
 
 No local executor or validator setup needed — just connect to devnet.
