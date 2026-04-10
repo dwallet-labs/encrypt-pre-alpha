@@ -170,8 +170,8 @@ fn process_instruction(program_id: &Address, accounts: &[AccountView], data: &[u
         Some((&3, rest)) => transfer(accounts, rest),
         Some((&4, rest)) => approve(accounts, rest),
         Some((&5, rest)) => revoke(accounts, rest),
-        Some((&7, rest)) => mint_to(accounts, rest),
-        Some((&8, rest)) => burn(accounts, rest),
+        // No standalone MintTo — tokens can only enter through Wrap (vault-backed)
+        // No standalone Burn — tokens can only exit through Unwrap (releases backing SPL)
         Some((&10, rest)) => freeze_account(accounts, rest),
         Some((&11, rest)) => thaw_account(accounts, rest),
         Some((&20, rest)) => transfer_from(accounts, rest),

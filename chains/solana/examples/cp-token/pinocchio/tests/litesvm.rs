@@ -451,34 +451,18 @@ fn create_account(
     AccountInfo { pda: account_pda, balance_ct: balance_pubkey, owner }
 }
 
-/// Mint tokens to an account. Returns the amount_ct pubkey.
+/// Set balance for testing — uses harness directly (no on-chain mint instruction).
+/// In production, tokens only enter through Wrap.
 fn do_mint(
     ctx: &mut EncryptTestContext,
     program_id: &Pubkey,
-    cpi_authority: &Pubkey,
-    cpi_bump: u8,
-    mint: &MintInfo,
+    _cpi_authority: &Pubkey,
+    _cpi_bump: u8,
+    _mint: &MintInfo,
     account: &AccountInfo,
     amount: u128,
 ) {
     let amount_ct = ctx.create_input::<Uint64>(amount, program_id);
-
-    let ix = mint_to_ix(
-        program_id,
-        &mint.pda,
-        &account.pda,
-        &account.balance_ct,
-        &amount_ct,
-        cpi_bump,
-        ctx.program_id(),
-        ctx.config_pda(),
-        ctx.deposit_pda(),
-        cpi_authority,
-        ctx.network_encryption_key_pda(),
-        &mint.authority.pubkey(),
-        ctx.event_authority(),
-    );
-    ctx.send_transaction(&[ix], &[&mint.authority]);
 
     let graph = mint_to_graph();
     ctx.enqueue_graph_execution(
@@ -596,20 +580,7 @@ fn test_mint_to() {
     assert_eq!(balance, 1_000_000);
 }
 
-#[test]
-fn test_mint_to_multiple() {
-    let mut ctx = EncryptTestContext::new_default();
-    let (program_id, cpi_authority, cpi_bump) = setup(&mut ctx);
-
-    let mint = create_mint(&mut ctx, &program_id, 6, false);
-    let alice = create_account(&mut ctx, &program_id, &cpi_authority, cpi_bump, &mint.pda);
-
-    do_mint(&mut ctx, &program_id, &cpi_authority, cpi_bump, &mint, &alice, 500);
-    do_mint(&mut ctx, &program_id, &cpi_authority, cpi_bump, &mint, &alice, 300);
-
-    let balance = ctx.decrypt_from_store(&alice.balance_ct);
-    assert_eq!(balance, 800);
-}
+// test_mint_to_multiple removed — standalone MintTo is disabled (vault-backed only)
 
 #[test]
 fn test_transfer() {
@@ -650,42 +621,7 @@ fn test_transfer_insufficient_funds() {
     assert_eq!(ctx.decrypt_from_store(&bob.balance_ct), 0);
 }
 
-#[test]
-fn test_burn() {
-    let mut ctx = EncryptTestContext::new_default();
-    let (program_id, cpi_authority, cpi_bump) = setup(&mut ctx);
-
-    let mint = create_mint(&mut ctx, &program_id, 6, false);
-    let alice = create_account(&mut ctx, &program_id, &cpi_authority, cpi_bump, &mint.pda);
-
-    do_mint(&mut ctx, &program_id, &cpi_authority, cpi_bump, &mint, &alice, 1000);
-
-    // Burn 400
-    let amount_ct = ctx.create_input::<Uint64>(400, &program_id);
-    let ix = burn_ix(
-        &program_id,
-        &alice.pda,
-        &mint.pda,
-        &alice.balance_ct,
-        &amount_ct,
-        cpi_bump,
-        ctx.program_id(),
-        ctx.config_pda(),
-        ctx.deposit_pda(),
-        &cpi_authority,
-        ctx.network_encryption_key_pda(),
-        &alice.owner.pubkey(),
-        ctx.event_authority(),
-    );
-    ctx.send_transaction(&[ix], &[&alice.owner]);
-
-    let graph = burn_graph();
-    ctx.enqueue_graph_execution(&graph, &[alice.balance_ct, amount_ct], &[alice.balance_ct]);
-    ctx.process_pending();
-    ctx.register_ciphertext(&alice.balance_ct);
-
-    assert_eq!(ctx.decrypt_from_store(&alice.balance_ct), 600);
-}
+// test_burn removed — standalone burn is disabled (tokens exit only via unwrap)
 
 #[test]
 fn test_approve_and_transfer_from() {
@@ -835,29 +771,9 @@ fn test_full_lifecycle() {
     assert_eq!(ctx.decrypt_from_store(&alice.balance_ct), 7_000);
     assert_eq!(ctx.decrypt_from_store(&bob.balance_ct), 3_000);
 
-    // 5. Bob burns 500
-    let burn_amount = ctx.create_input::<Uint64>(500, &program_id);
-    let burn = burn_ix(
-        &program_id,
-        &bob.pda,
-        &mint.pda,
-        &bob.balance_ct,
-        &burn_amount,
-        cpi_bump,
-        ctx.program_id(),
-        ctx.config_pda(),
-        ctx.deposit_pda(),
-        &cpi_authority,
-        ctx.network_encryption_key_pda(),
-        &bob.owner.pubkey(),
-        ctx.event_authority(),
-    );
-    ctx.send_transaction(&[burn], &[&bob.owner]);
-
-    let graph = burn_graph();
-    ctx.enqueue_graph_execution(&graph, &[bob.balance_ct, burn_amount], &[bob.balance_ct]);
-    ctx.process_pending();
-    ctx.register_ciphertext(&bob.balance_ct);
+    // 5. Transfer 500 Bob → Alice
+    do_transfer(&mut ctx, &program_id, &cpi_authority, cpi_bump, &bob, &alice, 500);
+    assert_eq!(ctx.decrypt_from_store(&alice.balance_ct), 7_500);
     assert_eq!(ctx.decrypt_from_store(&bob.balance_ct), 2_500);
 
     // 6. Freeze Alice, thaw, transfer again
@@ -868,7 +784,7 @@ fn test_full_lifecycle() {
     ctx.send_transaction(&[thaw], &[&mint.authority]);
 
     do_transfer(&mut ctx, &program_id, &cpi_authority, cpi_bump, &alice, &bob, 2_000);
-    assert_eq!(ctx.decrypt_from_store(&alice.balance_ct), 5_000);
+    assert_eq!(ctx.decrypt_from_store(&alice.balance_ct), 5_500);
     assert_eq!(ctx.decrypt_from_store(&bob.balance_ct), 4_500);
 
     // 7. Approve delegate, transfer_from
@@ -937,7 +853,7 @@ fn test_full_lifecycle() {
     ctx.register_ciphertext(&bob.balance_ct);
     ctx.register_ciphertext(&allowance_pubkey);
 
-    assert_eq!(ctx.decrypt_from_store(&alice.balance_ct), 4_250);
+    assert_eq!(ctx.decrypt_from_store(&alice.balance_ct), 4_750);
     assert_eq!(ctx.decrypt_from_store(&bob.balance_ct), 5_250);
     assert_eq!(ctx.decrypt_from_store(&allowance_pubkey), 250);
 }
