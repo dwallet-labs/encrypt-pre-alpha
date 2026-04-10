@@ -171,7 +171,6 @@ fn process_instruction(
         Some((&0, rest)) => create_pool(program_id, accounts, rest),
         Some((&1, rest)) => swap(accounts, rest),
         Some((&2, rest)) => add_liquidity(accounts, rest),
-        Some((&3, rest)) => request_decrypt(accounts, rest),
         Some((&4, rest)) => remove_liquidity(accounts, rest),
         Some((&5, rest)) => create_lp_position(program_id, accounts, rest),
         _ => Err(ProgramError::InvalidInstructionData),
@@ -349,21 +348,6 @@ fn remove_liquidity(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
         ra_ct, rb_ct, ts_ct, burn_ct, user_lp_ct,
         out_a_ct, out_b_ct, ra_ct, rb_ct, ts_ct, user_lp_ct,
     )?;
-    Ok(())
-}
-
-// ── 3: RequestDecrypt ──
-
-fn request_decrypt(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
-    let [req_acct, ct, encrypt_program, config, deposit, cpi_authority, caller_program, network_encryption_key, payer, event_authority, system_program, ..] =
-        accounts
-    else { return Err(ProgramError::NotEnoughAccountKeys); };
-    if !payer.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
-    if data.is_empty() { return Err(ProgramError::InvalidInstructionData); }
-
-    let ctx = EncryptContext { encrypt_program, config, deposit, cpi_authority, caller_program,
-        network_encryption_key, payer, event_authority, system_program, cpi_authority_bump: data[0] };
-    ctx.request_decryption(req_acct, ct)?;
     Ok(())
 }
 

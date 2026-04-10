@@ -87,16 +87,6 @@ export function addLiquidityIx(
   });
 }
 
-export function requestDecryptIx(ctx: SwapContext, req: PublicKey, ct: PublicKey): TransactionInstruction {
-  return new TransactionInstruction({
-    programId: ctx.programId, data: Buffer.from([3, ctx.cpiBump]),
-    keys: [
-      { pubkey: req, isSigner: true, isWritable: true },
-      { pubkey: ct, isSigner: false, isWritable: false },
-      ...encAccts(ctx).map(a => a.pubkey.equals(ctx.enc.configPda) ? { ...a, isWritable: false } : a),
-    ],
-  });
-}
 
 export function removeLiquidityIx(
   ctx: SwapContext, pool: PublicKey,
