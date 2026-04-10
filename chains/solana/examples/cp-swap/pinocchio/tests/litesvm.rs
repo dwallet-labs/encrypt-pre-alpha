@@ -268,6 +268,37 @@ fn rm_liq(ctx: &mut EncryptTestContext, pid: &Pubkey, auth: &Pubkey, bump: u8,
     assert!(a + b > 20000, "LP earned fees: {} + {} > 20000", a, b);
 }
 
+#[test] fn test_cannot_use_other_users_lp() {
+    let mut ctx = EncryptTestContext::new_default();
+    let (pid, auth, bump) = setup(&mut ctx);
+    let pool = mk_pool(&mut ctx, &pid, &auth, bump);
+
+    // Create LP position for a different owner (not payer)
+    let other_owner = Pubkey::new_unique();
+    let other_lp_ct = mk_lp(&mut ctx, &pid, &auth, bump, &pool, &other_owner);
+
+    // Add liquidity to OTHER's position — payer signs but position belongs to other_owner
+    // This should fail because lp_pos.owner != payer
+    let ac = ctx.create_input::<Uint128>(10000, &pid);
+    let bc = ctx.create_input::<Uint128>(10000, &pid);
+    let (lp_pda, _) = Pubkey::find_program_address(
+        &[b"cp_lp", pool.pda.as_ref(), other_owner.as_ref()], &pid);
+    let mut keys = vec![
+        AccountMeta::new_readonly(pool.pda, false),
+        AccountMeta::new_readonly(lp_pda, false),
+        AccountMeta::new(pool.ra, false), AccountMeta::new(pool.rb, false),
+        AccountMeta::new(pool.ts, false), AccountMeta::new(ac, false),
+        AccountMeta::new(bc, false), AccountMeta::new(other_lp_ct, false),
+    ];
+    keys.extend(enc_accounts(&ctx, &pid, &auth));
+    let ix = Instruction::new_with_bytes(pid, &[2, bump], keys);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.send_transaction(&[ix], &[]);
+    }));
+    assert!(result.is_err(), "should fail: payer != LP position owner");
+}
+
 #[test] fn test_swap_k_invariant() {
     let mut ctx = EncryptTestContext::new_default();
     let (pid, auth, bump) = setup(&mut ctx);
