@@ -162,53 +162,6 @@ export function transferIx(
   });
 }
 
-/** Instruction 21: RequestDecrypt */
-export function requestDecryptIx(
-  ctx: CpTokenContext,
-  tokenAccount: PublicKey,
-  requestAcct: PublicKey,
-  ciphertext: PublicKey,
-  owner: PublicKey
-): TransactionInstruction {
-  return new TransactionInstruction({
-    programId: ctx.programId,
-    data: Buffer.from([21, ctx.cpiBump]),
-    keys: [
-      { pubkey: tokenAccount, isSigner: false, isWritable: true },
-      { pubkey: requestAcct, isSigner: true, isWritable: true },
-      { pubkey: ciphertext, isSigner: false, isWritable: false },
-      ...encryptCpiAccounts(
-        ctx.enc,
-        ctx.programId,
-        ctx.cpiAuthority,
-        owner
-      ).map((a) =>
-        a.pubkey.equals(ctx.enc.configPda)
-          ? { ...a, isWritable: false }
-          : a
-      ),
-    ],
-  });
-}
-
-/** Instruction 22: RevealBalance */
-export function revealBalanceIx(
-  programId: PublicKey,
-  tokenAccount: PublicKey,
-  requestAcct: PublicKey,
-  owner: PublicKey
-): TransactionInstruction {
-  return new TransactionInstruction({
-    programId,
-    data: Buffer.from([22]),
-    keys: [
-      { pubkey: tokenAccount, isSigner: false, isWritable: true },
-      { pubkey: requestAcct, isSigner: false, isWritable: false },
-      { pubkey: owner, isSigner: true, isWritable: false },
-    ],
-  });
-}
-
 // ── Vault / Wrap / Unwrap ──
 
 export function deriveVaultPda(
@@ -273,40 +226,71 @@ export function wrapIx(
   });
 }
 
-/** Instruction 31: Unwrap (burn cpToken + release SPL in one step)
- *
- * Requires prior request_decrypt + reveal_balance so the on-chain
- * revealed_balance is set. The program checks revealed_balance >= amount.
- */
-export function unwrapIx(
-  ctx: CpTokenContext,
-  vault: PublicKey,
-  cpMint: PublicKey,
-  tokenAccount: PublicKey,
-  vaultAta: PublicKey,
-  userAta: PublicKey,
-  balanceCt: PublicKey,
-  amountCt: PublicKey,
-  owner: PublicKey,
-  amount: bigint
-): TransactionInstruction {
-  const data = Buffer.alloc(10);
-  data[0] = 31; // disc
-  data[1] = ctx.cpiBump;
-  data.writeBigUInt64LE(amount, 2);
+export function deriveReceiptPda(
+  programId: PublicKey, burnedCt: PublicKey
+): [PublicKey, number] {
+  return pda([Buffer.from("cp_receipt"), burnedCt.toBuffer()], programId);
+}
 
+/** Instruction 31: UnwrapBurn */
+export function unwrapBurnIx(
+  ctx: CpTokenContext, vault: PublicKey, tokenAccount: PublicKey,
+  receiptPda: PublicKey, receiptBump: number,
+  balanceCt: PublicKey, amountCt: PublicKey, burnedCt: PublicKey,
+  owner: PublicKey, amount: bigint
+): TransactionInstruction {
+  const data = Buffer.alloc(11);
+  data[0] = 31; data[1] = receiptBump; data[2] = ctx.cpiBump;
+  data.writeBigUInt64LE(amount, 3);
   return new TransactionInstruction({
-    programId: ctx.programId,
-    data,
+    programId: ctx.programId, data,
     keys: [
       { pubkey: vault, isSigner: false, isWritable: false },
-      { pubkey: cpMint, isSigner: false, isWritable: false },
       { pubkey: tokenAccount, isSigner: false, isWritable: true },
-      { pubkey: vaultAta, isSigner: false, isWritable: true },
-      { pubkey: userAta, isSigner: false, isWritable: true },
+      { pubkey: receiptPda, isSigner: false, isWritable: true },
       { pubkey: balanceCt, isSigner: false, isWritable: true },
       { pubkey: amountCt, isSigner: false, isWritable: true },
+      { pubkey: burnedCt, isSigner: false, isWritable: true },
       ...encryptCpiAccounts(ctx.enc, ctx.programId, ctx.cpiAuthority, owner),
+    ],
+  });
+}
+
+/** Instruction 32: UnwrapDecrypt */
+export function unwrapDecryptIx(
+  ctx: CpTokenContext, receipt: PublicKey,
+  requestAcct: PublicKey, burnedCt: PublicKey, owner: PublicKey
+): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: ctx.programId, data: Buffer.from([32, ctx.cpiBump]),
+    keys: [
+      { pubkey: receipt, isSigner: false, isWritable: true },
+      { pubkey: requestAcct, isSigner: true, isWritable: true },
+      { pubkey: burnedCt, isSigner: false, isWritable: false },
+      ...encryptCpiAccounts(ctx.enc, ctx.programId, ctx.cpiAuthority, owner)
+        .map(a => a.pubkey.equals(ctx.enc.configPda) ? { ...a, isWritable: false } : a),
+    ],
+  });
+}
+
+/** Instruction 33: UnwrapComplete */
+export function unwrapCompleteIx(
+  programId: PublicKey, receipt: PublicKey, vault: PublicKey,
+  cpMint: PublicKey, requestAcct: PublicKey,
+  vaultAta: PublicKey, userAta: PublicKey,
+  owner: PublicKey, destination: PublicKey
+): TransactionInstruction {
+  return new TransactionInstruction({
+    programId, data: Buffer.from([33]),
+    keys: [
+      { pubkey: receipt, isSigner: false, isWritable: true },
+      { pubkey: vault, isSigner: false, isWritable: false },
+      { pubkey: cpMint, isSigner: false, isWritable: false },
+      { pubkey: requestAcct, isSigner: false, isWritable: false },
+      { pubkey: vaultAta, isSigner: false, isWritable: true },
+      { pubkey: userAta, isSigner: false, isWritable: true },
+      { pubkey: owner, isSigner: true, isWritable: false },
+      { pubkey: destination, isSigner: false, isWritable: true },
       { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
     ],
   });
