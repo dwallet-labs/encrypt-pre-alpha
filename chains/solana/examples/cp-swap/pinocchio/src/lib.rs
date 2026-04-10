@@ -296,10 +296,11 @@ fn add_liquidity(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     if rb_ct.address().as_ref() != &pool.reserve_b { return Err(ProgramError::InvalidArgument); }
     if ts_ct.address().as_ref() != &pool.total_supply { return Err(ProgramError::InvalidArgument); }
 
-    // Verify LP position matches pool and user_lp_ct matches stored balance
+    // Verify LP position: must belong to this pool AND to the payer
     let lpd = unsafe { lp_pos_acct.borrow_unchecked() };
     let lp_pos = LpPosition::from_bytes(lpd)?;
     if &lp_pos.pool != pool_acct.address().as_array() { return Err(ProgramError::InvalidArgument); }
+    if &lp_pos.owner != payer.address().as_array() { return Err(ProgramError::InvalidArgument); }
     if user_lp_ct.address().as_ref() != &lp_pos.balance { return Err(ProgramError::InvalidArgument); }
 
     let ctx = EncryptContext { encrypt_program, config, deposit, cpi_authority, caller_program,
@@ -337,6 +338,7 @@ fn remove_liquidity(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     let lpd = unsafe { lp_pos_acct.borrow_unchecked() };
     let lp_pos = LpPosition::from_bytes(lpd)?;
     if &lp_pos.pool != pool_acct.address().as_array() { return Err(ProgramError::InvalidArgument); }
+    if &lp_pos.owner != payer.address().as_array() { return Err(ProgramError::InvalidArgument); }
     if user_lp_ct.address().as_ref() != &lp_pos.balance { return Err(ProgramError::InvalidArgument); }
 
     let ctx = EncryptContext { encrypt_program, config, deposit, cpi_authority, caller_program,
