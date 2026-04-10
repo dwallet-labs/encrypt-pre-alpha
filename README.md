@@ -97,6 +97,7 @@ The executor is running and handles:
 
 See `chains/solana/examples/` for complete working programs:
 - **CP-Token** — confidential performant token (P-Token + Encrypt FHE)
+- **CP-Swap** — confidential UniV2 AMM (composes with CP-Token)
 - **Confidential Voting** — encrypted tallies with conditional increment
 - **Counter** — basic encrypted counter
 - **ACL** — access control patterns

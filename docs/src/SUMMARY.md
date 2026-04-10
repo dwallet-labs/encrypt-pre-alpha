@@ -69,6 +69,9 @@
 - [CP-Token](./examples/cp-token/01-overview.md)
     - [Building the Program](./examples/cp-token/02-program.md)
     - [Testing](./examples/cp-token/03-testing.md)
+- [CP-Swap](./examples/cp-swap/01-overview.md)
+    - [Building the Program](./examples/cp-swap/02-program.md)
+    - [Testing](./examples/cp-swap/03-testing.md)
 
 # Reference
 

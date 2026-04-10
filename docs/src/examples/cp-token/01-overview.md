@@ -1,0 +1,62 @@
+# CP-Token: Overview
+
+## What It Is
+
+CP-Token (Confidential Performant Token) is a confidential token standard built on Encrypt FHE, modeled after Anza's [P-Token](https://github.com/anza-xyz/pinocchio/tree/main/programs/token). It replaces all plaintext balances and amounts with FHE-encrypted ciphertexts — same API surface as P-Token, full confidentiality.
+
+## What's Confidential
+
+- **Balances** — always encrypted. Nobody can see how much anyone holds.
+- **Transfer amounts** — client-encrypted via gRPC. Never plaintext on-chain.
+- **Allowances** — encrypted delegation for composability.
+- **LP positions** — when used with CP-Swap, LP ownership is encrypted.
+
+The only plaintext that ever appears is the withdrawal amount during unwrap, on a temporary receipt account that gets closed immediately.
+
+## Architecture
+
+```
+Public Domain (SPL Token)         Confidential Domain (CP-Token)
+┌─────────────────────┐           ┌──────────────────────────┐
+│ USDC, SOL, etc.     │           │ cpUSDC, cpSOL, etc.      │
+│ Balances visible    │── Wrap ──>│ Balances encrypted       │
+│ Transfers visible   │<─ Unwrap ─│ Transfers encrypted      │
+└─────────────────────┘           │ Composable with DeFi     │
+                                  └──────────────────────────┘
+```
+
+## Instructions
+
+| Disc | Instruction | Description |
+|------|-------------|-------------|
+| 0 | InitializeMint | Create a new token mint |
+| 1 | InitializeAccount | Create token account with encrypted zero balance |
+| 3 | Transfer | Encrypted owner transfer |
+| 4 | Approve | Approve delegate with encrypted allowance |
+| 5 | Revoke | Revoke delegation |
+| 10 | FreezeAccount | Freeze authority freezes account |
+| 11 | ThawAccount | Freeze authority thaws account |
+| 20 | TransferFrom | Delegated transfer (composability entry point) |
+| 23 | InitializeVault | Create vault linking CP-Token mint to SPL mint |
+| 30 | Wrap | Deposit SPL → mint cpTokens (vault-backed) |
+| 31 | UnwrapBurn | Burn cpTokens, create withdrawal receipt |
+| 32 | UnwrapDecrypt | Decrypt burned amount |
+| 33 | UnwrapComplete | Verify + release SPL, close receipt |
+
+## Vault-Backed Only
+
+There is no standalone `MintTo` or `Burn`. Tokens can only enter through `Wrap` (backed 1:1 by SPL tokens in the vault) and exit through the 3-step unwrap. Every cpToken is backed.
+
+## Composability
+
+Other programs CPI into CP-Token via `Approve` + `TransferFrom`. The delegate (another program's PDA) can move tokens on behalf of the user, with encrypted allowance enforcement:
+
+```rust
+// DeFi program (e.g., AMM, lending, dark pool)
+fn execute_trade(accounts) {
+    // CPI into CP-Token — move cpUSDC from user to pool
+    cp_token::transfer_from(user_account, pool_account, amount_ct, delegate_pda);
+}
+```
+
+The DeFi program never sees plaintext amounts. It just passes encrypted ciphertexts through CPI.
