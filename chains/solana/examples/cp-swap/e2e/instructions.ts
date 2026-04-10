@@ -30,7 +30,7 @@ function encAccts(ctx: SwapContext) {
 export function createPoolIx(
   ctx: SwapContext, poolPda: PublicKey, poolBump: number,
   mintA: PublicKey, mintB: PublicKey,
-  raCtx: PublicKey, rbCt: PublicKey, tsCt: PublicKey,
+  raCt: PublicKey, rbCt: PublicKey, tsCt: PublicKey, priceCt: PublicKey,
 ): TransactionInstruction {
   return new TransactionInstruction({
     programId: ctx.programId, data: Buffer.from([0, poolBump, ctx.cpiBump]),
@@ -38,9 +38,10 @@ export function createPoolIx(
       { pubkey: poolPda, isSigner: false, isWritable: true },
       { pubkey: mintA, isSigner: false, isWritable: false },
       { pubkey: mintB, isSigner: false, isWritable: false },
-      { pubkey: raCtx, isSigner: true, isWritable: true },
+      { pubkey: raCt, isSigner: true, isWritable: true },
       { pubkey: rbCt, isSigner: true, isWritable: true },
       { pubkey: tsCt, isSigner: true, isWritable: true },
+      { pubkey: priceCt, isSigner: true, isWritable: true },
       ...encAccts(ctx),
     ],
   });
@@ -49,7 +50,8 @@ export function createPoolIx(
 export function swapIx(
   ctx: SwapContext, pool: PublicKey,
   rIn: PublicKey, rOut: PublicKey,
-  amtIn: PublicKey, minOut: PublicKey, amtOut: PublicKey, dir: number,
+  amtIn: PublicKey, minOut: PublicKey, amtOut: PublicKey,
+  priceCt: PublicKey, dir: number,
 ): TransactionInstruction {
   return new TransactionInstruction({
     programId: ctx.programId, data: Buffer.from([1, ctx.cpiBump, dir]),
@@ -60,6 +62,7 @@ export function swapIx(
       { pubkey: amtIn, isSigner: false, isWritable: true },
       { pubkey: minOut, isSigner: false, isWritable: true },
       { pubkey: amtOut, isSigner: false, isWritable: true },
+      { pubkey: priceCt, isSigner: false, isWritable: true },
       ...encAccts(ctx),
     ],
   });

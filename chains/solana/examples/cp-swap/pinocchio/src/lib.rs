@@ -37,6 +37,11 @@ pub const ID: Address = Address::new_from_array([6u8; 32]);
 // ── Account layouts ──
 
 /// Pool state — PDA: `["cp_pool", mint_a, mint_b]`
+/// Pool state — PDA: `["cp_pool", mint_a, mint_b]`
+///
+/// `price_ct` is a PUBLIC ciphertext (authorized = [0; 32]).
+/// Anyone can read the price off-chain via gRPC `readCiphertext`.
+/// Reserves, LP supply, and individual positions stay encrypted.
 #[repr(C)]
 pub struct Pool {
     pub mint_a: [u8; 32],
@@ -44,6 +49,7 @@ pub struct Pool {
     pub reserve_a: [u8; 32],     // encrypted reserve A ciphertext
     pub reserve_b: [u8; 32],     // encrypted reserve B ciphertext
     pub total_supply: [u8; 32],  // encrypted LP total supply ciphertext
+    pub price_ct: [u8; 32],      // PUBLIC ciphertext: B per A (6 decimal precision)
     pub is_initialized: u8,
     pub bump: u8,
 }
@@ -87,11 +93,13 @@ fn minimum_balance(s: usize) -> u64 { (s as u64 + 128) * 6960 }
 // ── FHE Graphs ──
 
 /// Swap: x * y = k, 0.3% fee, slippage check. No-op if invalid.
+/// Outputs the new price (B per A, 6 decimal precision) as a public ciphertext.
 #[encrypt_fn]
 fn swap_graph(
     reserve_in: EUint128, reserve_out: EUint128,
     amount_in: EUint128, min_amount_out: EUint128,
-) -> (EUint128, EUint128, EUint128) {
+    current_price: EUint128,
+) -> (EUint128, EUint128, EUint128, EUint128) {
     let amount_in_with_fee = amount_in * 997;
     let numerator = amount_in_with_fee * reserve_out;
     let denominator = (reserve_in * 1000) + amount_in_with_fee;
@@ -106,7 +114,10 @@ fn swap_graph(
     let final_out = if valid { amount_out } else { amount_in - amount_in };
     let final_reserve_in = if valid { new_reserve_in } else { reserve_in };
     let final_reserve_out = if valid { new_reserve_out } else { reserve_out };
-    (final_out, final_reserve_in, final_reserve_out)
+    // Price: B per A with 6 decimal precision. On no-op, keep current price.
+    let new_price = (final_reserve_out * 1_000_000) / (final_reserve_in + 1);
+    let final_price = if valid { new_price } else { current_price };
+    (final_out, final_reserve_in, final_reserve_out, final_price)
 }
 
 /// Add liquidity: updates reserves, total supply, AND user's LP balance atomically.
@@ -182,7 +193,7 @@ fn process_instruction(
 fn create_pool(
     program_id: &Address, accounts: &[AccountView], data: &[u8],
 ) -> ProgramResult {
-    let [pool_acct, mint_a, mint_b, ra_ct, rb_ct, ts_ct, encrypt_program, config, deposit, cpi_authority, caller_program, network_encryption_key, payer, event_authority, system_program, ..] =
+    let [pool_acct, mint_a, mint_b, ra_ct, rb_ct, ts_ct, price_ct, encrypt_program, config, deposit, cpi_authority, caller_program, network_encryption_key, payer, event_authority, system_program, ..] =
         accounts
     else { return Err(ProgramError::NotEnoughAccountKeys); };
     if !payer.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
@@ -201,6 +212,9 @@ fn create_pool(
     ctx.create_plaintext_typed::<Uint128>(&0u128, ra_ct)?;
     ctx.create_plaintext_typed::<Uint128>(&0u128, rb_ct)?;
     ctx.create_plaintext_typed::<Uint128>(&0u128, ts_ct)?;
+    ctx.create_plaintext_typed::<Uint128>(&0u128, price_ct)?;
+    // Make price ciphertext public — anyone can read it off-chain
+    ctx.make_public(price_ct)?;
 
     let d = unsafe { pool_acct.borrow_unchecked_mut() };
     let pool = Pool::from_bytes_mut(d)?;
@@ -209,6 +223,7 @@ fn create_pool(
     pool.reserve_a.copy_from_slice(ra_ct.address().as_ref());
     pool.reserve_b.copy_from_slice(rb_ct.address().as_ref());
     pool.total_supply.copy_from_slice(ts_ct.address().as_ref());
+    pool.price_ct.copy_from_slice(price_ct.address().as_ref());
     pool.is_initialized = 1;
     pool.bump = pool_bump;
     Ok(())
@@ -254,7 +269,7 @@ fn create_lp_position(
 // ── 1: Swap ──
 
 fn swap(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
-    let [pool_acct, rin_ct, rout_ct, amt_in_ct, min_out_ct, amt_out_ct, encrypt_program, config, deposit, cpi_authority, caller_program, network_encryption_key, payer, event_authority, system_program, ..] =
+    let [pool_acct, rin_ct, rout_ct, amt_in_ct, min_out_ct, amt_out_ct, price_ct, encrypt_program, config, deposit, cpi_authority, caller_program, network_encryption_key, payer, event_authority, system_program, ..] =
         accounts
     else { return Err(ProgramError::NotEnoughAccountKeys); };
     if !payer.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
@@ -268,10 +283,13 @@ fn swap(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
         else { (&pool.reserve_b, &pool.reserve_a) };
     if rin_ct.address().as_ref() != ein { return Err(ProgramError::InvalidArgument); }
     if rout_ct.address().as_ref() != eout { return Err(ProgramError::InvalidArgument); }
+    if price_ct.address().as_ref() != &pool.price_ct { return Err(ProgramError::InvalidArgument); }
 
     let ctx = EncryptContext { encrypt_program, config, deposit, cpi_authority, caller_program,
         network_encryption_key, payer, event_authority, system_program, cpi_authority_bump: cpi_bump };
-    ctx.swap_graph(rin_ct, rout_ct, amt_in_ct, min_out_ct, amt_out_ct, rin_ct, rout_ct)?;
+    // swap_graph now takes current_price as input and outputs new_price
+    ctx.swap_graph(rin_ct, rout_ct, amt_in_ct, min_out_ct, price_ct,
+        amt_out_ct, rin_ct, rout_ct, price_ct)?;
     Ok(())
 }
 
@@ -403,19 +421,24 @@ mod tests {
 
     // ── Swap ──
     #[test] fn swap_basic() {
-        let r = run_mock(swap_graph, &[1000, 2000, 100, 0], &[T,T,T,T]);
+        // inputs: reserve_in, reserve_out, amount_in, min_out, current_price
+        let r = run_mock(swap_graph, &[1000, 2000, 100, 0, 2_000_000], &[T,T,T,T,T]);
         assert!(r[0] > 0); assert_eq!(r[1], 1100); assert!(r[1]*r[2] >= 1000*2000);
+        assert!(r[3] > 0, "price output should be non-zero");
     }
     #[test] fn swap_slippage() {
-        let r = run_mock(swap_graph, &[1000, 2000, 100, 999], &[T,T,T,T]);
+        let r = run_mock(swap_graph, &[1000, 2000, 100, 999, 2_000_000], &[T,T,T,T,T]);
         assert_eq!(r[0], 0); assert_eq!(r[1], 1000); assert_eq!(r[2], 2000);
+        assert_eq!(r[3], 2_000_000, "price unchanged on no-op");
     }
     #[test] fn swap_k_preserved() {
         let mut ra = 100_000u128; let mut rb = 100_000u128; let ik = ra*rb;
+        let mut price = 1_000_000u128;
         for (i, &a) in [500,300,1000,2000,100].iter().enumerate() {
             let (ri,ro) = if i%2==0 {(ra,rb)} else {(rb,ra)};
-            let r = run_mock(swap_graph, &[ri,ro,a,0], &[T,T,T,T]);
+            let r = run_mock(swap_graph, &[ri,ro,a,0,price], &[T,T,T,T,T]);
             if i%2==0 { ra=r[1]; rb=r[2]; } else { rb=r[1]; ra=r[2]; }
+            price = r[3];
         }
         assert!(ra*rb >= ik);
     }
@@ -465,7 +488,7 @@ mod tests {
     // ── Graph shapes ──
     #[test] fn graph_shapes() {
         let g = swap_graph(); let pg = parse_graph(&g).unwrap();
-        assert_eq!(pg.header().num_inputs(), 4); assert_eq!(pg.header().num_outputs(), 3);
+        assert_eq!(pg.header().num_inputs(), 5); assert_eq!(pg.header().num_outputs(), 4);
         let g = add_liquidity_graph(); let pg = parse_graph(&g).unwrap();
         assert_eq!(pg.header().num_inputs(), 6); assert_eq!(pg.header().num_outputs(), 4);
         let g = remove_liquidity_graph(); let pg = parse_graph(&g).unwrap();

@@ -15,7 +15,8 @@ use solana_sdk::signer::Signer;
 fn swap_graph(
     reserve_in: EUint128, reserve_out: EUint128,
     amount_in: EUint128, min_amount_out: EUint128,
-) -> (EUint128, EUint128, EUint128) {
+    current_price: EUint128,
+) -> (EUint128, EUint128, EUint128, EUint128) {
     let aif = amount_in * 997; let num = aif * reserve_out;
     let den = (reserve_in * 1000) + aif; let ao = num / den;
     let nri = reserve_in + amount_in; let nro = reserve_out - ao;
@@ -25,7 +26,9 @@ fn swap_graph(
     let fo = if v { ao } else { amount_in - amount_in };
     let fri = if v { nri } else { reserve_in };
     let fro = if v { nro } else { reserve_out };
-    (fo, fri, fro)
+    let np = (fro * 1_000_000) / (fri + 1);
+    let fp = if v { np } else { current_price };
+    (fo, fri, fro, fp)
 }
 
 #[encrypt_fn]
@@ -82,22 +85,23 @@ fn enc_accounts(ctx: &EncryptTestContext, pid: &Pubkey, auth: &Pubkey) -> Vec<Ac
     ]
 }
 
-struct PoolInfo { pda: Pubkey, ra: Pubkey, rb: Pubkey, ts: Pubkey }
+struct PoolInfo { pda: Pubkey, ra: Pubkey, rb: Pubkey, ts: Pubkey, price: Pubkey }
 
 fn mk_pool(ctx: &mut EncryptTestContext, pid: &Pubkey, auth: &Pubkey, bump: u8) -> PoolInfo {
     let ma = Pubkey::new_unique(); let mb = Pubkey::new_unique();
     let (pp, pb) = Pubkey::find_program_address(&[b"cp_pool", ma.as_ref(), mb.as_ref()], pid);
-    let ra = Keypair::new(); let rb = Keypair::new(); let ts = Keypair::new();
+    let ra = Keypair::new(); let rb = Keypair::new(); let ts = Keypair::new(); let pc = Keypair::new();
     let mut keys = vec![
         AccountMeta::new(pp, false), AccountMeta::new_readonly(ma, false),
         AccountMeta::new_readonly(mb, false),
         AccountMeta::new(ra.pubkey(), true), AccountMeta::new(rb.pubkey(), true),
-        AccountMeta::new(ts.pubkey(), true),
+        AccountMeta::new(ts.pubkey(), true), AccountMeta::new(pc.pubkey(), true),
     ];
     keys.extend(enc_accounts(ctx, pid, auth));
-    ctx.send_transaction(&[Instruction::new_with_bytes(*pid, &[0, pb, bump], keys)], &[&ra, &rb, &ts]);
-    let p = PoolInfo { pda: pp, ra: ra.pubkey(), rb: rb.pubkey(), ts: ts.pubkey() };
-    ctx.register_ciphertext(&p.ra); ctx.register_ciphertext(&p.rb); ctx.register_ciphertext(&p.ts);
+    ctx.send_transaction(&[Instruction::new_with_bytes(*pid, &[0, pb, bump], keys)], &[&ra, &rb, &ts, &pc]);
+    let p = PoolInfo { pda: pp, ra: ra.pubkey(), rb: rb.pubkey(), ts: ts.pubkey(), price: pc.pubkey() };
+    ctx.register_ciphertext(&p.ra); ctx.register_ciphertext(&p.rb);
+    ctx.register_ciphertext(&p.ts); ctx.register_ciphertext(&p.price);
     p
 }
 
@@ -165,14 +169,16 @@ fn do_swap(ctx: &mut EncryptTestContext, pid: &Pubkey, auth: &Pubkey, bump: u8,
     let mut keys = vec![
         AccountMeta::new_readonly(pool.pda, false),
         AccountMeta::new(ri, false), AccountMeta::new(ro, false),
-        AccountMeta::new(ic, false), AccountMeta::new(mc, false), AccountMeta::new(oc, false),
+        AccountMeta::new(ic, false), AccountMeta::new(mc, false),
+        AccountMeta::new(oc, false), AccountMeta::new(pool.price, false),
     ];
     keys.extend(enc_accounts(ctx, pid, auth));
     ctx.send_transaction(&[Instruction::new_with_bytes(*pid, &[1, bump, dir], keys)], &[]);
     let g = swap_graph();
-    ctx.enqueue_graph_execution(&g, &[ri, ro, ic, mc], &[oc, ri, ro]);
+    ctx.enqueue_graph_execution(&g, &[ri, ro, ic, mc, pool.price], &[oc, ri, ro, pool.price]);
     ctx.process_pending();
-    ctx.register_ciphertext(&pool.ra); ctx.register_ciphertext(&pool.rb); ctx.register_ciphertext(&oc);
+    ctx.register_ciphertext(&pool.ra); ctx.register_ciphertext(&pool.rb);
+    ctx.register_ciphertext(&oc); ctx.register_ciphertext(&pool.price);
     ctx.decrypt_from_store(&oc)
 }
 
