@@ -1,5 +1,7 @@
 # CP-Token: Overview
 
+> **Pre-Alpha Disclaimer:** This is an early pre-alpha release for exploring the SDK and starting development only. There is no real encryption — all data is completely public and stored as plaintext on-chain. Do not submit any sensitive or real data. Encryption keys and the trust model are not final; do not rely on any encryption guarantees or key material until mainnet. All interfaces, APIs, and data formats are subject to change without notice. The Solana program and all on-chain data will be wiped periodically and everything will be deleted when we transition to Encrypt Alpha 1. This software is provided "as is" without warranty of any kind; use is entirely at your own risk and dWallet Labs assumes no liability for any damages arising from its use.
+
 ## What It Is
 
 CP-Token (Confidential Performant Token) is a confidential token standard built on Encrypt FHE, modeled after Anza's [P-Token](https://github.com/anza-xyz/pinocchio/tree/main/programs/token). It replaces all plaintext balances and amounts with FHE-encrypted ciphertexts — same API surface as P-Token, full confidentiality.
@@ -27,21 +29,21 @@ Public Domain (SPL Token)         Confidential Domain (CP-Token)
 
 ## Instructions
 
-| Disc | Instruction | Description |
-|------|-------------|-------------|
-| 0 | InitializeMint | Create a new token mint |
-| 1 | InitializeAccount | Create token account with encrypted zero balance |
-| 3 | Transfer | Encrypted owner transfer |
-| 4 | Approve | Approve delegate with encrypted allowance |
-| 5 | Revoke | Revoke delegation |
-| 10 | FreezeAccount | Freeze authority freezes account |
-| 11 | ThawAccount | Freeze authority thaws account |
-| 20 | TransferFrom | Delegated transfer (composability entry point) |
-| 23 | InitializeVault | Create vault linking CP-Token mint to SPL mint |
-| 30 | Wrap | Deposit SPL → mint cpTokens (vault-backed) |
-| 31 | UnwrapBurn | Burn cpTokens, create withdrawal receipt |
-| 32 | UnwrapDecrypt | Decrypt burned amount |
-| 33 | UnwrapComplete | Verify + release SPL, close receipt |
+| Disc | Instruction       | Description                                      |
+| ---- | ----------------- | ------------------------------------------------ |
+| 0    | InitializeMint    | Create a new token mint                          |
+| 1    | InitializeAccount | Create token account with encrypted zero balance |
+| 3    | Transfer          | Encrypted owner transfer                         |
+| 4    | Approve           | Approve delegate with encrypted allowance        |
+| 5    | Revoke            | Revoke delegation                                |
+| 10   | FreezeAccount     | Freeze authority freezes account                 |
+| 11   | ThawAccount       | Freeze authority thaws account                   |
+| 20   | TransferFrom      | Delegated transfer (composability entry point)   |
+| 23   | InitializeVault   | Create vault linking CP-Token mint to SPL mint   |
+| 30   | Wrap              | Deposit SPL → mint cpTokens (vault-backed)       |
+| 31   | UnwrapBurn        | Burn cpTokens, create withdrawal receipt         |
+| 32   | UnwrapDecrypt     | Decrypt burned amount                            |
+| 33   | UnwrapComplete    | Verify + release SPL, close receipt              |
 
 ## Vault-Backed Only
 
