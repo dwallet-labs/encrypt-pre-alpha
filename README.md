@@ -96,6 +96,8 @@ The executor is running and handles:
 ## Examples
 
 See `chains/solana/examples/` for complete working programs:
+- **PC-Token** — confidential performant token (P-Token + Encrypt FHE)
+- **PC-Swap** — confidential UniV2 AMM (composes with PC-Token)
 - **Confidential Voting** — encrypted tallies with conditional increment
 - **Counter** — basic encrypted counter
 - **ACL** — access control patterns

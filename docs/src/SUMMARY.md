@@ -66,6 +66,12 @@
 - [Encrypted ACL](./examples/acl/01-overview.md)
     - [Building the Program](./examples/acl/02-program.md)
     - [Testing](./examples/acl/03-testing.md)
+- [PC-Token](./examples/pc-token/01-overview.md)
+    - [Building the Program](./examples/pc-token/02-program.md)
+    - [Testing](./examples/pc-token/03-testing.md)
+- [PC-Swap](./examples/pc-swap/01-overview.md)
+    - [Building the Program](./examples/pc-swap/02-program.md)
+    - [Testing](./examples/pc-swap/03-testing.md)
 
 # Reference
 

@@ -34,3 +34,15 @@ Encrypted voting where individual votes are hidden but the tally is computed via
 An on-chain access control list where permissions are stored as encrypted 64-bit bitmasks. Grant, revoke, and check operations use FHE bitwise operations (OR, AND). Nobody can see what permissions are set.
 
 **Covers:** Multiple FHE graphs in one program, inverse mask pattern for revocation, separate state accounts with independent decryption flows, admin-gated vs public operations.
+
+## PC-Token (Confidential Performant Token)
+
+A composable confidential token program — Anza's [P-Token](https://github.com/anza-xyz/pinocchio/tree/main/programs/token) architecture rebuilt with Encrypt FHE. All balances and transfer amounts are encrypted; nobody can see how many tokens any account holds or how much is being transferred. Follows P-Token's COption flags, AccountState enum, instruction discriminators, and freeze/thaw patterns.
+
+**Covers:** Encrypted balances (EUint64), client-encrypted transfer amounts, conditional FHE logic (insufficient funds → silent no-op), approve/transfer_from delegation for composability, freeze/thaw, vault-backed wrap/unwrap. Demonstrates how existing Solana token standards can be made confidential with Encrypt.
+
+## PC-Swap (Confidential UniV2 AMM)
+
+A confidential constant-product AMM that composes with PC-Token. All reserves, swap amounts, and LP positions are encrypted. The swap formula (x × y = k), fee calculation (0.3%), slippage protection, and LP ownership checks all run in the encrypted domain via FHE. The only public value is the price, published as a public ciphertext readable by anyone via gRPC.
+
+**Covers:** FHE arithmetic (multiply, divide) on EUint128, composability (AMM CPI into Encrypt for swap math), public ciphertexts (`make_public` for price oracle), LP position enforcement in FHE graphs, self-settling no-ops for invalid swaps.
