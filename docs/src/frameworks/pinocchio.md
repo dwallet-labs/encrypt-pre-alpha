@@ -71,4 +71,16 @@ let value: &u64 = read_decrypted_verified::<Uint64>(req_data, digest)?;
 
 ## Full Example
 
-See `chains/solana/examples/confidential-voting-pinocchio/` for a complete confidential voting program.
+See `chains/solana/examples/voting/pinocchio/` for a complete confidential voting program.
+
+## Framework Comparison
+
+| Consideration | Pinocchio | Native | Anchor | Quasar |
+|---|---|---|---|---|
+| **CU efficiency** | Best | Good | Good | Best |
+| **Binary size** | Small | Medium | Largest | Smallest |
+| **`no_std` support** | Yes | No | No | Yes |
+| **Account validation** | Manual | Manual | Declarative | Declarative |
+| **Zero-copy** | Manual | No | No | Built-in |
+
+All four SDKs implement the same `EncryptCpi` trait with identical CPI authority seeds and instruction discriminators. Consider [Quasar](./quasar.md) for declarative validation with Pinocchio-level performance.

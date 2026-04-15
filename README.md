@@ -17,7 +17,7 @@ crates/                             Chain-agnostic core
   encrypt-grpc/                     gRPC client types (proto-generated)
 
 chains/solana/                      Solana SDK
-  program-sdk/                      CPI SDKs (pinocchio, native, anchor)
+  program-sdk/                      CPI SDKs (pinocchio, native, anchor, quasar)
   dev/                              EncryptTxBuilder + runtime traits
   test/                             LiteSVM + ProgramTest test harness
   clients/                          Rust + TypeScript clients (Codama + gRPC)
@@ -103,7 +103,7 @@ See `chains/solana/examples/` for complete working programs:
 - **ACL** — access control patterns
 - **Coin Flip** — random encrypted boolean
 
-Each example has Pinocchio, Native, and Anchor variants with unit + integration tests.
+Each example has Pinocchio, Native, Anchor, and Quasar variants with unit + integration tests.
 
 ## Documentation
 

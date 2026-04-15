@@ -11,5 +11,6 @@ pub mod error;
 pub mod events;
 pub mod graph;
 pub mod identifier;
+#[cfg(feature = "bcs-serde")]
 pub mod messages;
 pub mod types;

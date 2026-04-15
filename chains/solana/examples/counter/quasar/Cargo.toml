@@ -1,0 +1,22 @@
+[package]
+name = "confidential-counter-quasar"
+version = "0.1.0"
+authors = ["dWallet Labs, Ltd. <dev@dwalletlabs.com>"]
+license = "BSD-3-Clause-Clear"
+publish = false
+edition = "2021"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(target_os, values("solana"))']
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+encrypt-types = { path = "../../../../../crates/encrypt-types", default-features = false }
+encrypt-solana-types = { path = "../../../program-sdk/types", default-features = false }
+encrypt-dsl = { package = "encrypt-solana-dsl", path = "../../../program-sdk/dsl" }
+encrypt-quasar = { path = "../../../program-sdk/quasar" }
+quasar-lang = { git = "https://github.com/blueshift-gg/quasar" }
+solana-address = { version = "2.2.0", features = ["curve25519"] }

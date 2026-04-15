@@ -1,4 +1,11 @@
 [workspace]
+exclude = [
+    "chains/solana/program-sdk/quasar",
+    "chains/solana/examples/voting/quasar",
+    "chains/solana/examples/counter/quasar",
+    "chains/solana/examples/acl/quasar",
+    "chains/solana/examples/coin-flip/quasar",
+]
 members = [
     "crates/encrypt-types",
     "crates/encrypt-dsl",
@@ -46,7 +53,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"
 
 [workspace.dependencies]
 # ── Internal crates ──
-encrypt-types = { path = "crates/encrypt-types" }
+encrypt-types = { path = "crates/encrypt-types", default-features = false }
 encrypt-dsl = { path = "crates/encrypt-dsl" }
 encrypt-dsl-macros = { path = "crates/encrypt-dsl/macros" }
 encrypt-dsl-compile = { path = "crates/encrypt-dsl-compile" }
@@ -61,6 +68,11 @@ encrypt-solana-dsl-macros = { path = "chains/solana/program-sdk/dsl/macros" }
 encrypt-pinocchio = { path = "chains/solana/program-sdk/pinocchio" }
 encrypt-native = { path = "chains/solana/program-sdk/native" }
 encrypt-anchor = { path = "chains/solana/program-sdk/anchor" }
+encrypt-quasar = { path = "chains/solana/program-sdk/quasar" }
+
+# ── Quasar ──
+quasar-lang = { git = "https://github.com/blueshift-gg/quasar", rev = "0e755949" }
+solana-instruction-view = "2"
 
 # ── Pinocchio ──
 pinocchio = { version = "^0.10", features = ["cpi", "copy"] }

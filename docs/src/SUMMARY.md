@@ -41,6 +41,7 @@
 - [Pinocchio](./frameworks/pinocchio.md)
 - [Anchor](./frameworks/anchor.md)
 - [Native](./frameworks/native.md)
+- [Quasar](./frameworks/quasar.md)
 
 # Testing
 

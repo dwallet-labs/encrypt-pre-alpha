@@ -6,6 +6,10 @@ license.workspace = true
 publish.workspace = true
 edition.workspace = true
 
+[features]
+default = ["bcs-serde"]
+bcs-serde = ["dep:bcs", "dep:serde"]
+
 [dependencies]
-bcs = { workspace = true }
-serde = { workspace = true }
+bcs = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }

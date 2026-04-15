@@ -26,7 +26,7 @@ solana-program-error = { workspace = true }
 thiserror = { workspace = true }
 
 # gRPC client
-encrypt-types = { workspace = true }
+encrypt-types = { workspace = true, features = ["bcs-serde"] }
 encrypt-compute = { workspace = true }
 encrypt-grpc = { workspace = true }
 solana-sdk = { workspace = true }
