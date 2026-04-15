@@ -24,6 +24,7 @@
 - [Types](./dsl/types.md)
 - [Operations](./dsl/operations.md)
 - [Constants](./dsl/constants.md)
+- [Vectors](./dsl/vectors.md)
 - [Conditionals](./dsl/conditionals.md)
 - [Graph Compilation](./dsl/graph-compilation.md)
 
