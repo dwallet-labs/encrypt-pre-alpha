@@ -156,6 +156,12 @@ impl<T: EncryptedType> HasFheTypeId for Encrypted<T> {
     const FHE_TYPE_ID: u8 = T::FHE_TYPE_ID;
 }
 
+impl<const FHE_TYPE: u8, T: EncryptedType, const SIZE: usize> HasFheTypeId
+    for EncryptedVector<FHE_TYPE, T, SIZE>
+{
+    const FHE_TYPE_ID: u8 = FHE_TYPE;
+}
+
 /// Zero-copy reference to a decrypted plaintext value for a given FHE type marker.
 ///
 /// ```ignore

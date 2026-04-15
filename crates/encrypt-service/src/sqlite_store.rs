@@ -8,7 +8,7 @@
 //!
 //! Two tables:
 //! - `ciphertexts`: on-chain ID → (digest, fhe_type, blob)
-//! - `digests`: keccak256 digest → plaintext value (for MockComputeEngine)
+//! - `digests`: keccak256 digest → plaintext value bytes (for MockComputeEngine)
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -42,10 +42,32 @@ impl SqliteStore {
             );
             CREATE TABLE IF NOT EXISTS digests (
                 digest   BLOB PRIMARY KEY,
-                value_lo INTEGER NOT NULL,
-                value_hi INTEGER NOT NULL
+                value    BLOB NOT NULL
             );",
         )?;
+
+        // Migrate legacy schema: if value_lo/value_hi columns exist, migrate data
+        // and recreate the table with the new schema.
+        let has_legacy = conn
+            .prepare("SELECT value_lo FROM digests LIMIT 0")
+            .is_ok();
+        if has_legacy {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS digests_new (
+                    digest BLOB PRIMARY KEY,
+                    value  BLOB NOT NULL
+                );
+                INSERT OR IGNORE INTO digests_new (digest, value)
+                    SELECT digest,
+                           CAST(
+                               ZEROBLOB(16) AS BLOB
+                           )
+                    FROM digests;
+                DROP TABLE digests;
+                ALTER TABLE digests_new RENAME TO digests;",
+            )
+            .ok();
+        }
 
         // WAL mode for concurrent reads
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -66,38 +88,39 @@ impl SqliteStore {
         engine: &mut MockComputeEngine,
     ) -> Result<usize, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT digest, value_lo, value_hi FROM digests")?;
+        let mut stmt = conn.prepare("SELECT digest, value FROM digests")?;
         let mut count = 0;
         let rows = stmt.query_map([], |row| {
             let digest: Vec<u8> = row.get(0)?;
-            let lo: i64 = row.get(1)?;
-            let hi: i64 = row.get(2)?;
-            Ok((digest, lo as u64, hi as u64))
+            let value: Vec<u8> = row.get(1)?;
+            Ok((digest, value))
         })?;
 
         for row in rows {
-            let (digest_vec, lo, hi) = row?;
+            let (digest_vec, value) = row?;
             if digest_vec.len() == 32 {
                 let mut digest = [0u8; 32];
                 digest.copy_from_slice(&digest_vec);
-                let value = (hi as u128) << 64 | lo as u128;
-                engine.register(digest, value);
+                engine.register_bytes(digest, value);
                 count += 1;
             }
         }
         Ok(count)
     }
 
-    /// Save a digest→value mapping (from the engine).
-    pub fn save_digest(&self, digest: &[u8; 32], value: u128) {
+    /// Save a digest→value mapping (bytes, supports vectors).
+    pub fn save_digest_bytes(&self, digest: &[u8; 32], value: &[u8]) {
         let conn = self.conn.lock().unwrap();
-        let lo = (value & u64::MAX as u128) as i64;
-        let hi = (value >> 64) as i64;
         conn.execute(
-            "INSERT OR REPLACE INTO digests (digest, value_lo, value_hi) VALUES (?1, ?2, ?3)",
-            params![digest.as_slice(), lo, hi],
+            "INSERT OR REPLACE INTO digests (digest, value) VALUES (?1, ?2)",
+            params![digest.as_slice(), value],
         )
         .ok();
+    }
+
+    /// Save a digest→value mapping (u128 scalar, backward-compatible convenience).
+    pub fn save_digest(&self, digest: &[u8; 32], value: u128) {
+        self.save_digest_bytes(digest, &value.to_le_bytes());
     }
 }
 
@@ -247,5 +270,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(u128::from_le_bytes(bytes[..16].try_into().unwrap()), value);
+    }
+
+    #[test]
+    fn sqlite_vector_digest() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let digest = [0xEE; 32];
+        let mut value = vec![0u8; 8192];
+        value[0..4].copy_from_slice(&42u32.to_le_bytes());
+        value[8188..8192].copy_from_slice(&99u32.to_le_bytes());
+        store.save_digest_bytes(&digest, &value);
+
+        let mut engine = MockComputeEngine::new();
+        let count = store.load_into_engine(&mut engine).unwrap();
+        assert_eq!(count, 1);
+
+        engine.register_bytes(digest, value.clone());
+        let bytes = encrypt_compute::engine::ComputeEngine::decrypt(
+            &mut engine,
+            &digest,
+            FheType::EVectorU32,
+        )
+        .unwrap();
+        assert_eq!(bytes.len(), 8192);
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 42);
+        assert_eq!(u32::from_le_bytes(bytes[8188..8192].try_into().unwrap()), 99);
     }
 }

@@ -18,6 +18,7 @@ build-sbf:
     cargo build-sbf --tools-version v1.54 --manifest-path chains/solana/examples/coin-flip/pinocchio/Cargo.toml
     cargo build-sbf --tools-version v1.54 --manifest-path chains/solana/examples/coin-flip/native/Cargo.toml
     cargo build-sbf --tools-version v1.54 --manifest-path chains/solana/examples/coin-flip/anchor/Cargo.toml
+    cargo build-sbf --tools-version v1.54 --manifest-path chains/solana/examples/vector-ops/pinocchio/Cargo.toml
 
 # Check all crates
 check:
@@ -59,6 +60,7 @@ test-examples-litesvm: build-sbf
     cargo test --test litesvm -p confidential-counter
     cargo test --test litesvm -p encrypted-coin-flip
     cargo test --test litesvm -p encrypted-acl
+    cargo test --test litesvm -p confidential-vector-ops
 
 # Example solana-program-test tests (e2e, needs .so)
 test-examples-program-test: build-sbf
@@ -110,6 +112,10 @@ demo-counter encrypt_id counter_id:
 # Run e2e coin flip demo
 demo-coin-flip encrypt_id coinflip_id:
     bun chains/solana/examples/coin-flip/e2e/main.ts {{encrypt_id}} {{coinflip_id}}
+
+# Run e2e vector ops demo (Rust)
+demo-vector encrypt_id vector_id:
+    cargo run --manifest-path chains/solana/examples/vector-ops/e2e/e2e-vector-rust/Cargo.toml -- {{encrypt_id}} {{vector_id}}
 
 # Run e2e ACL demo
 demo-acl encrypt_id acl_id:

@@ -69,6 +69,17 @@ impl EncryptTestContext {
             .expect("create_input_ciphertext failed")
     }
 
+    pub fn create_input_bytes(
+        &mut self,
+        fhe_type: FheType,
+        plaintext_bytes: &[u8],
+        authorized: &Pubkey,
+    ) -> Pubkey {
+        self.harness
+            .create_input_ciphertext_bytes(fhe_type, plaintext_bytes, authorized)
+            .expect("create_input_ciphertext_bytes failed")
+    }
+
     pub fn create_plaintext<T: EncryptedType>(
         &mut self,
         value: &T::DecryptedValue,
@@ -212,6 +223,24 @@ impl EncryptTestContext {
 
     pub fn minimum_balance(&self, data_len: usize) -> u64 {
         self.harness.tx_builder().runtime().minimum_balance(data_len)
+    }
+
+    pub fn decrypt_bytes(&mut self, ciphertext_pubkey: &Pubkey) -> Vec<u8> {
+        let digest = self
+            .harness
+            .store()
+            .get_digest(&ciphertext_pubkey.to_bytes())
+            .expect("ciphertext not in store");
+        let fhe_type = self
+            .harness
+            .store()
+            .get(&ciphertext_pubkey.to_bytes())
+            .map(|e| e.fhe_type)
+            .unwrap_or(encrypt_types::types::FheType::EUint64);
+        self.harness
+            .engine_mut()
+            .decrypt(&digest, fhe_type)
+            .expect("decrypt failed")
     }
 
     pub fn decrypt_from_store(&mut self, ciphertext_pubkey: &Pubkey) -> u128 {

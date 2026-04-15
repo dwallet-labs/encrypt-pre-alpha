@@ -1,6 +1,9 @@
 // Copyright (c) dWallet Labs, Ltd.
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::types::{FheOperation, FheType};
 
 /// Metadata associated with a ciphertext, used in off-chain digest computation.
@@ -113,6 +116,13 @@ pub fn mock_binary_compute_value(
         FheOperation::IsGreaterThan | FheOperation::IsGreaterThanScalar => (a > b) as u128,
         FheOperation::IsGreaterOrEqual | FheOperation::IsGreaterOrEqualScalar => (a >= b) as u128,
         FheOperation::IsLessOrEqual | FheOperation::IsLessOrEqualScalar => (a <= b) as u128,
+        FheOperation::RandomRange => {
+            // Deterministic mock: hash(a) % b
+            if b == 0 { 0 } else {
+                let mixed = a.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (mixed & mask) % b
+            }
+        }
         _ => 0,
     }
 }
@@ -132,6 +142,18 @@ pub fn mock_unary_compute_value(op: FheOperation, a: u128, fhe_type: FheType) ->
             if bits == 0 { 0 } else { (a >> (bits - 1)) & 1 }
         }
         FheOperation::Into => a & mask,
+        FheOperation::PackInto => a & mask,
+        FheOperation::Random => {
+            // Deterministic mock "random": hash the input to produce a pseudo-random value
+            // Use a simple mixing function so tests are reproducible
+            let mixed = a.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            mixed & mask
+        }
+        FheOperation::From | FheOperation::Encrypt | FheOperation::Decrypt
+        | FheOperation::KeySwitch | FheOperation::ReEncrypt => {
+            // Key management: passthrough in mock mode
+            a & mask
+        }
         _ => 0,
     }
 }
@@ -159,6 +181,292 @@ pub fn mock_select(condition: &[u8; 32], if_true: &[u8; 32], if_false: &[u8; 32]
     } else {
         *if_false
     }
+}
+
+// ── Bytes-based helpers for vector types ──
+
+/// Returns `true` if the operation is a scalar variant (e.g., AddScalar, MultiplyScalar).
+/// In scalar ops, the RHS is a single scalar value broadcast to all vector elements.
+fn is_scalar_op(op: FheOperation) -> bool {
+    matches!(
+        op,
+        FheOperation::AddScalar
+            | FheOperation::MultiplyScalar
+            | FheOperation::SubtractScalar
+            | FheOperation::DivideScalar
+            | FheOperation::ModuloScalar
+            | FheOperation::MinScalar
+            | FheOperation::MaxScalar
+            | FheOperation::AndScalar
+            | FheOperation::OrScalar
+            | FheOperation::XorScalar
+            | FheOperation::IsLessThanScalar
+            | FheOperation::IsEqualScalar
+            | FheOperation::IsNotEqualScalar
+            | FheOperation::IsGreaterThanScalar
+            | FheOperation::IsGreaterOrEqualScalar
+            | FheOperation::IsLessOrEqualScalar
+    )
+}
+
+/// Mock mode: compute a binary FHE operation on byte-array values.
+///
+/// For vectors, operates element-wise using the scalar element type.
+/// For scalar ops (AddScalar, etc.), the RHS is broadcast to each element.
+/// For scalars, delegates to `mock_binary_compute_value`.
+pub fn mock_binary_compute_value_bytes(
+    op: FheOperation,
+    a: &[u8],
+    b: &[u8],
+    fhe_type: FheType,
+) -> Vec<u8> {
+    // Vector-specific structural ops (not element-wise arithmetic)
+    if fhe_type.is_arithmetic_vector() {
+        match op {
+            FheOperation::Gather => return mock_vector_gather(a, b, fhe_type),
+            FheOperation::Scatter => return mock_vector_scatter(a, b, fhe_type),
+            FheOperation::Copy => return b.to_vec(),
+            FheOperation::Get => return mock_vector_get(a, b, fhe_type),
+            _ => {}
+        }
+    }
+
+    if fhe_type.is_arithmetic_vector() {
+        let elem_bw = fhe_type.element_byte_width();
+        let scalar_ft = fhe_type.scalar_element_type();
+        let count = fhe_type.element_count();
+        let is_scalar = is_scalar_op(op);
+        // For scalar ops, read the scalar value once (from b, which may be shorter)
+        let scalar_b = if is_scalar { bytes_to_u128(b) } else { 0 };
+        let mut result = vec![0u8; fhe_type.byte_width()];
+        for i in 0..count {
+            let off = i * elem_bw;
+            let av = read_le_u128(a, off, elem_bw);
+            let bv = if is_scalar { scalar_b } else { read_le_u128(b, off, elem_bw) };
+            let rv = mock_binary_compute_value(op, av, bv, scalar_ft);
+            write_le_u128(&mut result, off, elem_bw, rv);
+        }
+        result
+    } else if fhe_type.is_bit_vector() {
+        // Bit vectors: bytewise boolean operations
+        let bw = fhe_type.byte_width();
+        let is_scalar = is_scalar_op(op);
+        let scalar_b = if is_scalar { bytes_to_u128(b) } else { 0 };
+        let mut result = vec![0u8; bw];
+        for i in 0..bw {
+            let av = a.get(i).copied().unwrap_or(0) as u128;
+            let bv = if is_scalar { scalar_b } else { b.get(i).copied().unwrap_or(0) as u128 };
+            result[i] = mock_binary_compute_value(op, av, bv, FheType::EUint8) as u8;
+        }
+        result
+    } else {
+        // Scalar
+        let av = bytes_to_u128(a);
+        let bv = bytes_to_u128(b);
+        let rv = mock_binary_compute_value(op, av, bv, fhe_type);
+        u128_to_bytes(rv, fhe_type.byte_width())
+    }
+}
+
+/// Mock mode: compute a unary FHE operation on byte-array values.
+pub fn mock_unary_compute_value_bytes(
+    op: FheOperation,
+    a: &[u8],
+    fhe_type: FheType,
+) -> Vec<u8> {
+    if fhe_type.is_arithmetic_vector() {
+        let elem_bw = fhe_type.element_byte_width();
+        let scalar_ft = fhe_type.scalar_element_type();
+        let count = fhe_type.element_count();
+        let mut result = vec![0u8; fhe_type.byte_width()];
+        for i in 0..count {
+            let off = i * elem_bw;
+            let av = read_le_u128(a, off, elem_bw);
+            let rv = mock_unary_compute_value(op, av, scalar_ft);
+            write_le_u128(&mut result, off, elem_bw, rv);
+        }
+        result
+    } else if fhe_type.is_bit_vector() {
+        let bw = fhe_type.byte_width();
+        let mut result = vec![0u8; bw];
+        for i in 0..bw {
+            let av = a.get(i).copied().unwrap_or(0) as u128;
+            result[i] = mock_unary_compute_value(op, av, FheType::EUint8) as u8;
+        }
+        result
+    } else {
+        let av = bytes_to_u128(a);
+        let rv = mock_unary_compute_value(op, av, fhe_type);
+        u128_to_bytes(rv, fhe_type.byte_width())
+    }
+}
+
+/// Mock mode: conditional select on byte-array values.
+/// Condition is always a scalar bool (first byte nonzero = true).
+pub fn mock_select_value_bytes(cond: &[u8], if_true: &[u8], if_false: &[u8]) -> Vec<u8> {
+    let c = bytes_to_u128(cond);
+    if c != 0 { if_true.to_vec() } else { if_false.to_vec() }
+}
+
+/// Read up to 16 bytes from a slice at an offset as little-endian u128.
+fn read_le_u128(data: &[u8], offset: usize, len: usize) -> u128 {
+    let mut buf = [0u8; 16];
+    let copy = len.min(16);
+    let end = (offset + copy).min(data.len());
+    let actual = end.saturating_sub(offset);
+    buf[..actual].copy_from_slice(&data[offset..offset + actual]);
+    u128::from_le_bytes(buf)
+}
+
+/// Write a u128 value as little-endian bytes into a slice at an offset.
+fn write_le_u128(data: &mut [u8], offset: usize, len: usize, value: u128) {
+    let bytes = value.to_le_bytes();
+    let copy = len.min(16);
+    data[offset..offset + copy].copy_from_slice(&bytes[..copy]);
+}
+
+/// Convert a byte slice to u128 (LE, zero-padded).
+fn bytes_to_u128(data: &[u8]) -> u128 {
+    let mut buf = [0u8; 16];
+    let len = data.len().min(16);
+    buf[..len].copy_from_slice(&data[..len]);
+    u128::from_le_bytes(buf)
+}
+
+/// Convert u128 to a byte vector of the given width (LE, truncated).
+fn u128_to_bytes(value: u128, byte_width: usize) -> Vec<u8> {
+    let full = value.to_le_bytes();
+    let mut result = vec![0u8; byte_width];
+    let copy = byte_width.min(16);
+    result[..copy].copy_from_slice(&full[..copy]);
+    result
+}
+
+/// Mock mode: compute a ternary FHE operation on byte-array values.
+///
+/// For Assign: a=vector, b=indices, c=values → result = a with a[b[i]] = c[i].
+/// For AssignScalars: a=vector, b=indices, c=scalar → result = a with a[b[i]] = c[0].
+pub fn mock_ternary_compute_value_bytes(
+    op: FheOperation,
+    a: &[u8],
+    b: &[u8],
+    c: &[u8],
+    fhe_type: FheType,
+) -> Vec<u8> {
+    match op {
+        FheOperation::Assign if fhe_type.is_arithmetic_vector() => mock_vector_assign(a, b, c, fhe_type),
+        FheOperation::AssignScalars if fhe_type.is_arithmetic_vector() => mock_vector_assign_scalars(a, b, c, fhe_type),
+        FheOperation::SelectScalar => mock_select_scalar_bytes(a, b, c, fhe_type),
+        FheOperation::Select => mock_select_value_bytes(a, b, c),
+        _ => a.to_vec(),
+    }
+}
+
+/// SelectScalar: element-wise conditional select.
+/// result[i] = a[i] != 0 ? b[i] : c[i]
+/// a=condition vector, b=if_true, c=if_false
+fn mock_select_scalar_bytes(cond: &[u8], if_true: &[u8], if_false: &[u8], fhe_type: FheType) -> Vec<u8> {
+    if fhe_type.is_arithmetic_vector() {
+        let elem_bw = fhe_type.element_byte_width();
+        let count = fhe_type.element_count();
+        let mut result = vec![0u8; fhe_type.byte_width()];
+        for i in 0..count {
+            let off = i * elem_bw;
+            let c = read_le_u128(cond, off, elem_bw);
+            let val = if c != 0 {
+                read_le_u128(if_true, off, elem_bw)
+            } else {
+                read_le_u128(if_false, off, elem_bw)
+            };
+            write_le_u128(&mut result, off, elem_bw, val);
+        }
+        result
+    } else {
+        // Scalar: single element select
+        let c = bytes_to_u128(cond);
+        if c != 0 { if_true.to_vec() } else { if_false.to_vec() }
+    }
+}
+
+// ── Vector-specific structural ops ──
+
+/// Gather: result[i] = a[b[i]] — index-based lookup.
+/// Indices in `b` are element values interpreted as usize. Out-of-bounds → 0.
+fn mock_vector_gather(a: &[u8], b: &[u8], fhe_type: FheType) -> Vec<u8> {
+    let elem_bw = fhe_type.element_byte_width();
+    let count = fhe_type.element_count();
+    let mut result = vec![0u8; fhe_type.byte_width()];
+    for i in 0..count {
+        let idx = read_le_u128(b, i * elem_bw, elem_bw) as usize;
+        if idx < count {
+            let val = read_le_u128(a, idx * elem_bw, elem_bw);
+            write_le_u128(&mut result, i * elem_bw, elem_bw, val);
+        }
+        // out-of-bounds indices produce 0 (already zeroed)
+    }
+    result
+}
+
+/// Scatter: result[b[i]] = a[i] — write elements of `a` to positions specified by `b`.
+/// Duplicate indices: last write wins. Unwritten positions stay 0.
+fn mock_vector_scatter(a: &[u8], b: &[u8], fhe_type: FheType) -> Vec<u8> {
+    let elem_bw = fhe_type.element_byte_width();
+    let count = fhe_type.element_count();
+    let mut result = vec![0u8; fhe_type.byte_width()];
+    for i in 0..count {
+        let idx = read_le_u128(b, i * elem_bw, elem_bw) as usize;
+        if idx < count {
+            let val = read_le_u128(a, i * elem_bw, elem_bw);
+            write_le_u128(&mut result, idx * elem_bw, elem_bw, val);
+        }
+    }
+    result
+}
+
+/// Assign: result = a, then result[b[i]] = c[i] for each i.
+/// Ternary: a=base vector, b=indices, c=values to assign.
+fn mock_vector_assign(a: &[u8], b: &[u8], c: &[u8], fhe_type: FheType) -> Vec<u8> {
+    let elem_bw = fhe_type.element_byte_width();
+    let count = fhe_type.element_count();
+    let mut result = a.to_vec();
+    for i in 0..count {
+        let idx = read_le_u128(b, i * elem_bw, elem_bw) as usize;
+        if idx < count {
+            let val = read_le_u128(c, i * elem_bw, elem_bw);
+            write_le_u128(&mut result, idx * elem_bw, elem_bw, val);
+        }
+    }
+    result
+}
+
+/// AssignScalars: result = a, then result[b[i]] = c[0] (scalar broadcast).
+/// Ternary: a=base vector, b=indices, c=scalar value (read from first element).
+fn mock_vector_assign_scalars(a: &[u8], b: &[u8], c: &[u8], fhe_type: FheType) -> Vec<u8> {
+    let elem_bw = fhe_type.element_byte_width();
+    let count = fhe_type.element_count();
+    let scalar = read_le_u128(c, 0, elem_bw);
+    let mut result = a.to_vec();
+    for i in 0..count {
+        let idx = read_le_u128(b, i * elem_bw, elem_bw) as usize;
+        if idx < count {
+            write_le_u128(&mut result, idx * elem_bw, elem_bw, scalar);
+        }
+    }
+    result
+}
+
+/// Get: extract element at index b[0] from a. Result is a vector with
+/// the extracted value at position 0, rest zeros.
+fn mock_vector_get(a: &[u8], b: &[u8], fhe_type: FheType) -> Vec<u8> {
+    let elem_bw = fhe_type.element_byte_width();
+    let count = fhe_type.element_count();
+    let idx = read_le_u128(b, 0, elem_bw) as usize;
+    let mut result = vec![0u8; fhe_type.byte_width()];
+    if idx < count {
+        let val = read_le_u128(a, idx * elem_bw, elem_bw);
+        write_le_u128(&mut result, 0, elem_bw, val);
+    }
+    result
 }
 
 // ── Internal helpers ──
@@ -618,5 +926,156 @@ mod tests {
         let big = u128::MAX / 2;
         let a = encode_mock_digest(FheType::EUint128, big);
         assert_eq!(decode_mock_identifier(&a), big);
+    }
+
+    // ── Missing scalar variant ops ──
+
+    #[test]
+    fn mock_divide_scalar() {
+        let a = encode_mock_digest(FheType::EUint32, 84);
+        let b = encode_mock_digest(FheType::EUint32, 2);
+        assert_eq!(decode_mock_identifier(&mock_binary_compute(FheOperation::DivideScalar, &a, &b, FheType::EUint32)), 42);
+    }
+
+    #[test]
+    fn mock_modulo_scalar() {
+        let a = encode_mock_digest(FheType::EUint32, 47);
+        let b = encode_mock_digest(FheType::EUint32, 5);
+        assert_eq!(decode_mock_identifier(&mock_binary_compute(FheOperation::ModuloScalar, &a, &b, FheType::EUint32)), 2);
+    }
+
+    #[test]
+    fn mock_min_scalar() {
+        let a = encode_mock_digest(FheType::EUint32, 10);
+        let b = encode_mock_digest(FheType::EUint32, 20);
+        assert_eq!(decode_mock_identifier(&mock_binary_compute(FheOperation::MinScalar, &a, &b, FheType::EUint32)), 10);
+        assert_eq!(decode_mock_identifier(&mock_binary_compute(FheOperation::MinScalar, &b, &a, FheType::EUint32)), 10);
+    }
+
+    #[test]
+    fn mock_max_scalar() {
+        let a = encode_mock_digest(FheType::EUint32, 10);
+        let b = encode_mock_digest(FheType::EUint32, 20);
+        assert_eq!(decode_mock_identifier(&mock_binary_compute(FheOperation::MaxScalar, &a, &b, FheType::EUint32)), 20);
+        assert_eq!(decode_mock_identifier(&mock_binary_compute(FheOperation::MaxScalar, &b, &a, FheType::EUint32)), 20);
+    }
+
+    #[test]
+    fn mock_and_scalar() {
+        let a = encode_mock_digest(FheType::EUint8, 0xFF);
+        let b = encode_mock_digest(FheType::EUint8, 0x0F);
+        assert_eq!(decode_mock_identifier(&mock_binary_compute(FheOperation::AndScalar, &a, &b, FheType::EUint8)), 0x0F);
+    }
+
+    #[test]
+    fn mock_or_scalar() {
+        let a = encode_mock_digest(FheType::EUint8, 0xF0);
+        let b = encode_mock_digest(FheType::EUint8, 0x0F);
+        assert_eq!(decode_mock_identifier(&mock_binary_compute(FheOperation::OrScalar, &a, &b, FheType::EUint8)), 0xFF);
+    }
+
+    #[test]
+    fn mock_xor_scalar() {
+        let a = encode_mock_digest(FheType::EUint8, 0xFF);
+        let b = encode_mock_digest(FheType::EUint8, 0x0F);
+        assert_eq!(decode_mock_identifier(&mock_binary_compute(FheOperation::XorScalar, &a, &b, FheType::EUint8)), 0xF0);
+    }
+
+    // ── Missing scalar comparison variants ──
+
+    #[test]
+    fn mock_all_scalar_comparison_ops() {
+        let a = encode_mock_digest(FheType::EUint32, 10);
+        let b = encode_mock_digest(FheType::EUint32, 20);
+        let eq = encode_mock_digest(FheType::EUint32, 10);
+        let check = |op, lhs: &[u8; 32], rhs: &[u8; 32]| -> u128 {
+            decode_mock_identifier(&mock_binary_compute(op, lhs, rhs, FheType::EUint32))
+        };
+        assert_eq!(check(FheOperation::IsEqualScalar, &a, &eq), 1);
+        assert_eq!(check(FheOperation::IsEqualScalar, &a, &b), 0);
+        assert_eq!(check(FheOperation::IsNotEqualScalar, &a, &b), 1);
+        assert_eq!(check(FheOperation::IsNotEqualScalar, &a, &eq), 0);
+        assert_eq!(check(FheOperation::IsGreaterThanScalar, &b, &a), 1);
+        assert_eq!(check(FheOperation::IsGreaterThanScalar, &a, &b), 0);
+        assert_eq!(check(FheOperation::IsGreaterOrEqualScalar, &a, &eq), 1);
+        assert_eq!(check(FheOperation::IsGreaterOrEqualScalar, &a, &b), 0);
+        assert_eq!(check(FheOperation::IsLessOrEqualScalar, &a, &eq), 1);
+        assert_eq!(check(FheOperation::IsLessOrEqualScalar, &b, &a), 0);
+    }
+
+    // ── Missing unary ops ──
+
+    #[test]
+    fn mock_into() {
+        let a = encode_mock_digest(FheType::EUint8, 42);
+        let r = mock_unary_compute(FheOperation::Into, &a, FheType::EUint8);
+        assert_eq!(decode_mock_identifier(&r), 42);
+    }
+
+    #[test]
+    fn mock_bootstrap() {
+        let a = encode_mock_digest(FheType::EUint32, 99);
+        let r = mock_unary_compute(FheOperation::Bootstrap, &a, FheType::EUint32);
+        assert_eq!(decode_mock_identifier(&r), 99, "bootstrap preserves value");
+    }
+
+    #[test]
+    fn mock_thin_bootstrap() {
+        let a = encode_mock_digest(FheType::EUint32, 77);
+        let r = mock_unary_compute(FheOperation::ThinBootstrap, &a, FheType::EUint32);
+        assert_eq!(decode_mock_identifier(&r), 77, "thin_bootstrap preserves value");
+    }
+
+    // ── Blend ──
+
+    #[test]
+    fn mock_blend() {
+        let a = encode_mock_digest(FheType::EUint32, 42);
+        let b = encode_mock_digest(FheType::EUint32, 99);
+        assert_eq!(decode_mock_identifier(&mock_binary_compute(FheOperation::Blend, &a, &b, FheType::EUint32)), 42);
+    }
+
+    // ── Random ──
+
+    #[test]
+    fn mock_random() {
+        let a = encode_mock_digest(FheType::EUint32, 42);
+        let r = mock_unary_compute(FheOperation::Random, &a, FheType::EUint32);
+        let val = decode_mock_identifier(&r);
+        assert_ne!(val, 42, "random should differ from input");
+        assert!(val <= u32::MAX as u128, "should be within u32 range");
+        // Deterministic: same input → same output
+        let r2 = mock_unary_compute(FheOperation::Random, &a, FheType::EUint32);
+        assert_eq!(r, r2, "deterministic mock random");
+    }
+
+    #[test]
+    fn mock_random_range() {
+        let a = encode_mock_digest(FheType::EUint32, 42);
+        let b = encode_mock_digest(FheType::EUint32, 100);
+        let r = mock_binary_compute(FheOperation::RandomRange, &a, &b, FheType::EUint32);
+        let val = decode_mock_identifier(&r);
+        assert!(val < 100, "random_range should be < 100, got {val}");
+    }
+
+    // ── PackInto ──
+
+    #[test]
+    fn mock_pack_into() {
+        let a = encode_mock_digest(FheType::EUint8, 0xFF);
+        let r = mock_unary_compute(FheOperation::PackInto, &a, FheType::EUint8);
+        assert_eq!(decode_mock_identifier(&r), 0xFF, "pack_into preserves value within range");
+    }
+
+    // ── Key management (passthrough) ──
+
+    #[test]
+    fn mock_key_management_passthrough() {
+        let a = encode_mock_digest(FheType::EUint32, 42);
+        for op in [FheOperation::From, FheOperation::Encrypt, FheOperation::Decrypt,
+                   FheOperation::KeySwitch, FheOperation::ReEncrypt] {
+            let r = mock_unary_compute(op, &a, FheType::EUint32);
+            assert_eq!(decode_mock_identifier(&r), 42, "{op:?} should passthrough");
+        }
     }
 }

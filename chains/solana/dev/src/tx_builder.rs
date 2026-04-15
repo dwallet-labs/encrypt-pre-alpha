@@ -124,37 +124,56 @@ impl<R: SolanaRuntime> EncryptTxBuilder<R> {
     }
 
     /// Authority writes decrypted plaintext to a decryption request.
+    ///
+    /// For large plaintexts (e.g., 8192-byte vectors), automatically splits
+    /// into multiple transactions. The on-chain program tracks `bytes_written`
+    /// and accepts chunks until `total_len` is reached.
     pub fn respond_decryption(
         &mut self,
         request_pk: &[u8; 32],
         plaintext: &[u8],
     ) -> Result<(), EncryptDevError> {
-        let mut ix_data = Vec::with_capacity(1 + plaintext.len());
-        ix_data.push(disc::RESPOND_DECRYPTION);
-        ix_data.extend_from_slice(plaintext);
+        // Safe chunk size: Solana tx limit ~1232 bytes. Account for:
+        // 2 signatures (128B) + compact header (~3B) + 6 account keys (192B)
+        // + instruction header (~5B) + discriminator (1B) = ~329B overhead.
+        // Leave margin: 900 bytes per chunk.
+        const MAX_CHUNK: usize = 700;
 
         let request_pubkey = Pubkey::from(*request_pk);
+        let accounts = vec![
+            AccountMeta::new_readonly(self.authority_pda, false),
+            AccountMeta::new(request_pubkey, false),
+            AccountMeta::new_readonly(self.authority.pubkey(), true),
+            AccountMeta::new_readonly(self.event_authority, false),
+            AccountMeta::new_readonly(self.program_id, false),
+        ];
 
-        let ix = Instruction::new_with_bytes(
-            self.program_id,
-            &ix_data,
-            vec![
-                AccountMeta::new_readonly(self.authority_pda, false),
-                AccountMeta::new(request_pubkey, false),
-                AccountMeta::new_readonly(self.authority.pubkey(), true),
-                AccountMeta::new_readonly(self.event_authority, false),
-                AccountMeta::new_readonly(self.program_id, false),
-            ],
-        );
+        let mut offset = 0;
+        while offset < plaintext.len() {
+            let end = (offset + MAX_CHUNK).min(plaintext.len());
+            let chunk = &plaintext[offset..end];
 
-        let blockhash = self.runtime.latest_blockhash();
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&self.payer.pubkey()),
-            &[&self.payer, &self.authority],
-            blockhash,
-        );
-        self.runtime.send_transaction(&tx)
+            let mut ix_data = Vec::with_capacity(1 + chunk.len());
+            ix_data.push(disc::RESPOND_DECRYPTION);
+            ix_data.extend_from_slice(chunk);
+
+            let ix = Instruction::new_with_bytes(
+                self.program_id,
+                &ix_data,
+                accounts.clone(),
+            );
+
+            let blockhash = self.runtime.latest_blockhash();
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&self.payer.pubkey()),
+                &[&self.payer, &self.authority],
+                blockhash,
+            );
+            self.runtime.send_transaction(&tx)?;
+            offset = end;
+        }
+        Ok(())
     }
 
     // ── User-facing operations ──
@@ -316,7 +335,7 @@ impl<R: SolanaRuntime> EncryptTxBuilder<R> {
     pub fn request_decryption(
         &mut self,
         ciphertext_pubkey: &Pubkey,
-        byte_width: usize,
+        _byte_width: usize,
         requester: &Keypair,
     ) -> Result<Pubkey, EncryptDevError> {
         let req_keypair = Keypair::new();

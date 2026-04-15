@@ -184,6 +184,7 @@ pub fn expr(e: &Expr, ctx: &mut Ctx) -> Result<(proc_macro2::TokenStream, u8), s
                 }
 
                 // Ternary methods (2 args: a, b; receiver = condition/mask)
+                // Result type = a_tid (from first arg)
                 "blend" | "select_scalar" => {
                     if mc.args.len() != 2 {
                         return Err(syn::Error::new_spanned(
@@ -201,6 +202,28 @@ pub fn expr(e: &Expr, ctx: &mut Ctx) -> Result<(proc_macro2::TokenStream, u8), s
                     );
                     ctx.vars.insert(tmp.clone(), a_tid);
                     Ok((quote! { #ti }, a_tid))
+                }
+
+                // Ternary vector methods (2 args; receiver = vector to modify)
+                // receiver.assign(indices, values) → ternary(receiver, indices, values)
+                // Result type = recv_tid (same as receiver)
+                "assign" | "assign_scalars" => {
+                    if mc.args.len() != 2 {
+                        return Err(syn::Error::new_spanned(
+                            &mc.method,
+                            format!("`{}` needs 2 args", mc.method),
+                        ));
+                    }
+                    let op = method_op(&mc.method)?;
+                    let (a_tok, _) = expr(&mc.args[0], ctx)?;
+                    let (b_tok, _) = expr(&mc.args[1], ctx)?;
+                    let tmp = ctx.temp();
+                    let ti = format_ident!("{}", tmp);
+                    ctx.stmts.push(
+                        quote! { let #ti = __gb.add_ternary_op(#op, #recv_tid, #recv_tok, #a_tok, #b_tok); },
+                    );
+                    ctx.vars.insert(tmp.clone(), recv_tid);
+                    Ok((quote! { #ti }, recv_tid))
                 }
 
                 // Binary methods (1 arg) — default for all other ops
@@ -236,13 +259,20 @@ pub fn expr(e: &Expr, ctx: &mut Ctx) -> Result<(proc_macro2::TokenStream, u8), s
         Expr::Binary(bin) => {
             let (l_tok, l_tid) = expr(&bin.left, ctx)?;
             let (r_tok, r_tid) = if let Ok(val) = parse_const_value(&bin.right) {
-                // Right operand is a bare literal — auto-create constant with left's type
+                // Right operand is a bare literal — auto-create constant.
+                // For vector types, create scalar element constant so maybe_scalar_op
+                // can promote to the scalar variant (e.g., MultiplyScalar).
+                let const_tid = if l_tid >= 16 {
+                    scalar_element_tid(l_tid)
+                } else {
+                    l_tid
+                };
                 let tmp = ctx.temp();
                 let ti = format_ident!("{}", tmp);
                 ctx.stmts
-                    .push(quote! { let #ti = __gb.add_constant(#l_tid, #val); });
-                ctx.vars.insert(tmp.clone(), l_tid);
-                (quote! { #ti }, l_tid)
+                    .push(quote! { let #ti = __gb.add_constant(#const_tid, #val); });
+                ctx.vars.insert(tmp.clone(), const_tid);
+                (quote! { #ti }, const_tid)
             } else {
                 expr(&bin.right, ctx)?
             };
@@ -783,6 +813,28 @@ fn method_op(ident: &syn::Ident) -> Result<u8, syn::Error> {
 
 /// If left operand is a vector (type 16-44) and right is a scalar (0-15),
 /// return the scalar variant of the operation. Otherwise return the base op.
+/// Map a vector type ID to its scalar element type ID.
+/// Returns the input unchanged for non-vector types.
+fn scalar_element_tid(tid: u8) -> u8 {
+    match tid {
+        32 => 1,  // EVectorU8 -> EUint8
+        33 => 2,  // EVectorU16 -> EUint16
+        34 => 3,  // EVectorU32 -> EUint32
+        35 => 4,  // EVectorU64 -> EUint64
+        36 => 5,  // EVectorU128 -> EUint128
+        37 => 6,  // EVectorU256 -> EUint256
+        38 => 8,  // EVectorU512 -> EUint512
+        39 => 9,  // EVectorU1024 -> EUint1024
+        40 => 10, // EVectorU2048 -> EUint2048
+        41 => 11, // EVectorU4096 -> EUint4096
+        42 => 12, // EVectorU8192 -> EUint8192
+        43 => 13, // EVectorU16384 -> EUint16384
+        44 => 14, // EVectorU32768 -> EUint32768
+        16..=31 => 0, // Bit vectors -> EBool
+        _ => tid,
+    }
+}
+
 fn maybe_scalar_op(base_op: u8, left_tid: u8, right_tid: u8) -> u8 {
     if left_tid >= 16 && right_tid <= 15 {
         match base_op {

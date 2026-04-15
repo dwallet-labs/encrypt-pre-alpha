@@ -114,6 +114,114 @@ impl FheType {
         }
     }
 
+    /// Returns `true` for any vector type (boolean or arithmetic).
+    pub fn is_vector(&self) -> bool {
+        matches!(
+            self,
+            Self::EBitVector2 | Self::EBitVector4 | Self::EBitVector8
+            | Self::EBitVector16 | Self::EBitVector32 | Self::EBitVector64
+            | Self::EBitVector128 | Self::EBitVector256 | Self::EBitVector512
+            | Self::EBitVector1024 | Self::EBitVector2048 | Self::EBitVector4096
+            | Self::EBitVector8192 | Self::EBitVector16384 | Self::EBitVector32768
+            | Self::EBitVector65536
+            | Self::EVectorU8 | Self::EVectorU16 | Self::EVectorU32
+            | Self::EVectorU64 | Self::EVectorU128 | Self::EVectorU256
+            | Self::EVectorU512 | Self::EVectorU1024 | Self::EVectorU2048
+            | Self::EVectorU4096 | Self::EVectorU8192 | Self::EVectorU16384
+            | Self::EVectorU32768
+        )
+    }
+
+    /// Returns `true` for arithmetic vectors (discriminants 32–44).
+    pub fn is_arithmetic_vector(&self) -> bool {
+        matches!(
+            self,
+            Self::EVectorU8 | Self::EVectorU16 | Self::EVectorU32
+            | Self::EVectorU64 | Self::EVectorU128 | Self::EVectorU256
+            | Self::EVectorU512 | Self::EVectorU1024 | Self::EVectorU2048
+            | Self::EVectorU4096 | Self::EVectorU8192 | Self::EVectorU16384
+            | Self::EVectorU32768
+        )
+    }
+
+    /// Returns `true` for boolean vectors (discriminants 16–31).
+    pub fn is_bit_vector(&self) -> bool {
+        matches!(
+            self,
+            Self::EBitVector2 | Self::EBitVector4 | Self::EBitVector8
+            | Self::EBitVector16 | Self::EBitVector32 | Self::EBitVector64
+            | Self::EBitVector128 | Self::EBitVector256 | Self::EBitVector512
+            | Self::EBitVector1024 | Self::EBitVector2048 | Self::EBitVector4096
+            | Self::EBitVector8192 | Self::EBitVector16384 | Self::EBitVector32768
+            | Self::EBitVector65536
+        )
+    }
+
+    /// Map a vector type to its scalar element type.
+    /// Scalars return themselves.
+    pub fn scalar_element_type(&self) -> FheType {
+        match self {
+            Self::EVectorU8 => Self::EUint8,
+            Self::EVectorU16 => Self::EUint16,
+            Self::EVectorU32 => Self::EUint32,
+            Self::EVectorU64 => Self::EUint64,
+            Self::EVectorU128 => Self::EUint128,
+            Self::EVectorU256 => Self::EUint256,
+            Self::EVectorU512 => Self::EUint512,
+            Self::EVectorU1024 => Self::EUint1024,
+            Self::EVectorU2048 => Self::EUint2048,
+            Self::EVectorU4096 => Self::EUint4096,
+            Self::EVectorU8192 => Self::EUint8192,
+            Self::EVectorU16384 => Self::EUint16384,
+            Self::EVectorU32768 => Self::EUint32768,
+            Self::EBitVector2 | Self::EBitVector4 | Self::EBitVector8
+            | Self::EBitVector16 | Self::EBitVector32 | Self::EBitVector64
+            | Self::EBitVector128 | Self::EBitVector256 | Self::EBitVector512
+            | Self::EBitVector1024 | Self::EBitVector2048 | Self::EBitVector4096
+            | Self::EBitVector8192 | Self::EBitVector16384 | Self::EBitVector32768
+            | Self::EBitVector65536 => Self::EBool,
+            other => *other,
+        }
+    }
+
+    /// Byte width of a single element. For scalars, same as `byte_width()`.
+    /// For arithmetic vectors, the element size (e.g., 4 for EVectorU32).
+    /// For bit vectors, returns 1 (packed byte operations).
+    pub fn element_byte_width(&self) -> usize {
+        self.scalar_element_type().byte_width()
+    }
+
+    /// Number of elements. Scalars return 1.
+    /// Arithmetic vectors: `8192 / element_byte_width()`.
+    /// Bit vectors: the element count from the type name.
+    pub fn element_count(&self) -> usize {
+        if self.is_arithmetic_vector() {
+            8192 / self.element_byte_width()
+        } else if self.is_bit_vector() {
+            match self {
+                Self::EBitVector2 => 2,
+                Self::EBitVector4 => 4,
+                Self::EBitVector8 => 8,
+                Self::EBitVector16 => 16,
+                Self::EBitVector32 => 32,
+                Self::EBitVector64 => 64,
+                Self::EBitVector128 => 128,
+                Self::EBitVector256 => 256,
+                Self::EBitVector512 => 512,
+                Self::EBitVector1024 => 1024,
+                Self::EBitVector2048 => 2048,
+                Self::EBitVector4096 => 4096,
+                Self::EBitVector8192 => 8192,
+                Self::EBitVector16384 => 16384,
+                Self::EBitVector32768 => 32768,
+                Self::EBitVector65536 => 65536,
+                _ => unreachable!(),
+            }
+        } else {
+            1
+        }
+    }
+
     /// Convert a raw discriminant to [`FheType`].
     /// Returns `None` for values outside `0..=44`.
     pub fn from_u8(val: u8) -> Option<Self> {
@@ -400,5 +508,54 @@ mod tests {
             FheOperation::ToBoolean.result_type(FheType::EUint128),
             FheType::EBool
         );
+    }
+
+    #[test]
+    fn is_vector_types() {
+        assert!(!FheType::EBool.is_vector());
+        assert!(!FheType::EUint64.is_vector());
+        assert!(!FheType::EUint65536.is_vector());
+        assert!(FheType::EBitVector2.is_vector());
+        assert!(FheType::EBitVector65536.is_vector());
+        assert!(FheType::EVectorU32.is_vector());
+        assert!(FheType::EVectorU32768.is_vector());
+    }
+
+    #[test]
+    fn is_arithmetic_vector_types() {
+        assert!(!FheType::EUint64.is_arithmetic_vector());
+        assert!(!FheType::EBitVector32.is_arithmetic_vector());
+        assert!(FheType::EVectorU8.is_arithmetic_vector());
+        assert!(FheType::EVectorU32.is_arithmetic_vector());
+        assert!(FheType::EVectorU32768.is_arithmetic_vector());
+    }
+
+    #[test]
+    fn scalar_element_type_mapping() {
+        assert_eq!(FheType::EVectorU32.scalar_element_type(), FheType::EUint32);
+        assert_eq!(FheType::EVectorU64.scalar_element_type(), FheType::EUint64);
+        assert_eq!(FheType::EVectorU128.scalar_element_type(), FheType::EUint128);
+        assert_eq!(FheType::EBitVector256.scalar_element_type(), FheType::EBool);
+        assert_eq!(FheType::EUint64.scalar_element_type(), FheType::EUint64);
+    }
+
+    #[test]
+    fn element_byte_width_values() {
+        assert_eq!(FheType::EVectorU8.element_byte_width(), 1);
+        assert_eq!(FheType::EVectorU32.element_byte_width(), 4);
+        assert_eq!(FheType::EVectorU64.element_byte_width(), 8);
+        assert_eq!(FheType::EVectorU128.element_byte_width(), 16);
+        assert_eq!(FheType::EUint64.element_byte_width(), 8);
+    }
+
+    #[test]
+    fn element_count_values() {
+        assert_eq!(FheType::EVectorU8.element_count(), 8192);
+        assert_eq!(FheType::EVectorU32.element_count(), 2048);
+        assert_eq!(FheType::EVectorU64.element_count(), 1024);
+        assert_eq!(FheType::EVectorU128.element_count(), 512);
+        assert_eq!(FheType::EVectorU32768.element_count(), 2);
+        assert_eq!(FheType::EBitVector256.element_count(), 256);
+        assert_eq!(FheType::EUint64.element_count(), 1);
     }
 }

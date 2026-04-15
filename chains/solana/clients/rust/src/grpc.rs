@@ -49,6 +49,16 @@ impl TypedInput {
             fhe_type: FheType::from_u8(T::FHE_TYPE_ID).unwrap(),
         }
     }
+
+    /// Create a typed input from raw bytes and an FHE type.
+    ///
+    /// Use for vector types or when you have pre-serialized plaintext.
+    pub fn from_raw(fhe_type: FheType, plaintext_bytes: Vec<u8>) -> Self {
+        Self {
+            plaintext_bytes,
+            fhe_type,
+        }
+    }
 }
 
 /// A raw (pre-encrypted) input.

@@ -159,6 +159,27 @@ impl<R: InProcessTestRuntime> EncryptTestHarness<R> {
         Ok(ct_pubkey)
     }
 
+    /// Create a verified encrypted input from raw bytes (for vectors and large types).
+    pub fn create_input_ciphertext_bytes(
+        &mut self,
+        fhe_type: FheType,
+        plaintext_bytes: &[u8],
+        authorized: &Pubkey,
+    ) -> Result<Pubkey, EncryptDevError> {
+        let digest = self
+            .engine
+            .encode_constant_bytes(fhe_type, plaintext_bytes)
+            .map_err(|e| EncryptDevError::GraphEval(format!("{e:?}")))?;
+
+        let ct_pubkey = self
+            .tx_builder
+            .create_input_ciphertext(fhe_type as u8, &digest, authorized)?;
+
+        self.store
+            .put(ct_pubkey.to_bytes(), digest, fhe_type, None);
+        Ok(ct_pubkey)
+    }
+
     /// Create a plaintext ciphertext (computes mock digest internally).
     pub fn create_plaintext_ciphertext(
         &mut self,

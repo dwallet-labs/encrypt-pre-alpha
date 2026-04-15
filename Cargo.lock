@@ -1652,6 +1652,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "confidential-vector-ops"
+version = "0.1.0"
+dependencies = [
+ "encrypt-compute",
+ "encrypt-pinocchio",
+ "encrypt-solana-dsl",
+ "encrypt-solana-test",
+ "encrypt-types",
+ "pinocchio",
+ "pinocchio-system",
+ "solana-sdk",
+]
+
+[[package]]
 name = "confidential-voting-anchor"
 version = "0.1.0"
 dependencies = [

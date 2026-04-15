@@ -103,16 +103,14 @@ pub fn evaluate_graph<E: ComputeEngine>(
             }
 
             k if k == GraphNodeKind::Constant as u8 => {
-                let byte_width = ft.byte_width().min(16);
+                let byte_width = ft.byte_width();
                 let offset = node.const_offset() as usize;
-                let mut buf = [0u8; 16];
                 let constants = pg.constants();
                 if offset + byte_width > constants.len() {
                     return Err(EvalError::InvalidGraph);
                 }
-                buf[..byte_width].copy_from_slice(&constants[offset..offset + byte_width]);
-                let value = u128::from_le_bytes(buf);
-                engine.encode_constant(ft, value).map_err(EvalError::Compute)?
+                let value_bytes = &constants[offset..offset + byte_width];
+                engine.encode_constant_bytes(ft, value_bytes).map_err(EvalError::Compute)?
             }
 
             k if k == GraphNodeKind::Op as u8 => {
@@ -127,16 +125,13 @@ pub fn evaluate_graph<E: ComputeEngine>(
                     });
                 }
 
-                if node.op_type() == FheOperation::Select as u8 {
-                    // Ternary select: condition=a, if_true=b, if_false=c
-                    if b >= digests.len() || c >= digests.len() {
-                        return Err(EvalError::InvalidNodeReference {
-                            node_index: i,
-                            operand_index: b.max(c),
-                        });
-                    }
+                if c != 0xFFFF && c < digests.len() && b < digests.len() {
+                    // Ternary operation: Select, Assign, AssignScalars, etc.
+                    let op = unsafe {
+                        core::mem::transmute::<u8, FheOperation>(node.op_type())
+                    };
                     engine
-                        .select(&digests[a], &digests[b], &digests[c])
+                        .ternary_op(op, &digests[a], &digests[b], &digests[c], ft)
                         .map_err(EvalError::Compute)?
                 } else if b == 0xFFFF {
                     // Unary operation
