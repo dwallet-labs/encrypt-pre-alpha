@@ -74,10 +74,15 @@ pub struct CiphertextCreatedRequest {
     pub source_chain: SourceChain,
     /// Ciphertext identifier.
     pub ciphertext_id: OnChainId,
-    /// The digest (may be zero for plaintext ciphertexts).
+    /// The digest (zero when created via `create_plaintext_ciphertext` —
+    /// the executor must encrypt `plaintext_bytes` and submit a `commit_ciphertext`).
     pub ciphertext_digest: [u8; 32],
     /// FHE type.
     pub fhe_type: u8,
+    /// Plaintext bytes recovered from the originating instruction, when the
+    /// ciphertext was created via `create_plaintext_ciphertext`. Empty for
+    /// `create_input_ciphertext` (digest already known at gRPC time).
+    pub plaintext_bytes: Vec<u8>,
 }
 
 /// Decryption request — decryptor must decrypt and respond.
