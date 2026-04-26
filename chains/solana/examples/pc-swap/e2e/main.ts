@@ -26,7 +26,7 @@ const payer = (() => { try { return Keypair.fromSecretKey(Uint8Array.from(JSON.p
 
 async function e(grpc: any, v: bigint, nk: Buffer): Promise<PublicKey> {
   const { ciphertextIdentifiers } = await grpc.createInput({ chain: Chain.Solana,
-    inputs: [{ ciphertextBytes: mockCiphertext(v), fheType: FHE128 }],
+    inputs: [{ ciphertextBytes: mockCiphertext(v, FHE128), fheType: FHE128 }],
     authorized: SP.toBytes(), networkEncryptionPublicKey: nk });
   return new PublicKey(ciphertextIdentifiers[0]);
 }

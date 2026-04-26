@@ -91,7 +91,7 @@ function CoinFlipApp() {
       const grpcClient = createEncryptWebClient(GRPC_URL);
       const ids = await grpcClient.createInput({
         chain: Chain.SOLANA,
-        inputs: [{ ciphertextBytes: encryptValue(playerVal), fheType: 4 }],
+        inputs: [{ ciphertextBytes: encryptValue(playerVal, 4), fheType: 4 }],
         authorized: COINFLIP_PROGRAM.toBytes(),
         networkEncryptionPublicKey: NETWORK_KEY,
       });

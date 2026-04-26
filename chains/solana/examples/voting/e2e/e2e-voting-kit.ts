@@ -159,11 +159,12 @@ async function pollUntil(
 }
 
 /** Encode a mock plaintext value as the "encrypted ciphertext" for dev mode. */
-function mockCiphertext(value: bigint): Uint8Array {
-  const buf = new Uint8Array(16);
+function mockCiphertext(value: bigint, fheType: number): Uint8Array {
+  const buf = new Uint8Array(17);
+  buf[0] = fheType;
   let v = value;
   for (let i = 0; i < 16; i++) {
-    buf[i] = Number(v & 0xffn);
+    buf[1 + i] = Number(v & 0xffn);
     v >>= 8n;
   }
   return buf;
@@ -341,7 +342,7 @@ async function main() {
     // Submit encrypted vote via gRPC → executor creates the ciphertext on-chain
     const { ciphertextIdentifiers } = await encrypt.createInput({
       chain: Chain.Solana,
-      inputs: [{ ciphertextBytes: mockCiphertext(BigInt(vote)), fheType: FHE_BOOL }],
+      inputs: [{ ciphertextBytes: mockCiphertext(BigInt(vote), FHE_BOOL), fheType: FHE_BOOL }],
       authorized: addressEncoder.encode(VOTING_PROGRAM),
       networkEncryptionPublicKey: networkKey,
     });

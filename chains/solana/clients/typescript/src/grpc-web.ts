@@ -8,7 +8,7 @@
  *   import { createEncryptWebClient, encryptValue, Chain } from "@encrypt.xyz/pre-alpha-solana-client/grpc-web";
  *
  *   const client = createEncryptWebClient("https://pre-alpha-dev-1.encrypt.ika-network.net:443");
- *   const ct = encryptValue(42);
+ *   const ct = encryptValue(42, 4); // value, fheType (EUint64 = 4)
  *   const ids = await client.createInput({
  *     chain: Chain.SOLANA,
  *     inputs: [{ ciphertextBytes: ct, fheType: 4 }],
@@ -70,16 +70,21 @@ export function createEncryptWebClient(baseUrl: string) {
 
 /**
  * Client-side mock encryption (dev mode).
- * Encodes a plaintext value as little-endian u128 bytes.
+ *
+ * Emits the executor's legacy 17-byte input format:
+ * `[fhe_type(1) || value_le(16)]`. The type tag is required — without it the
+ * executor falls into a fallback that misreads multi-byte scalars (e.g.
+ * EUint64 returns `value >> 8`).
  *
  * In production, this is replaced by a WASM FHE encryptor that produces
  * real ciphertexts + a ZK proof of valid encryption.
  */
-export function encryptValue(value: number | bigint): Uint8Array {
-  const buf = new Uint8Array(16);
+export function encryptValue(value: number | bigint, fheType: number): Uint8Array {
+  const buf = new Uint8Array(17);
+  buf[0] = fheType;
   let v = BigInt(value);
   for (let i = 0; i < 16; i++) {
-    buf[i] = Number(v & 0xffn);
+    buf[1 + i] = Number(v & 0xffn);
     v >>= 8n;
   }
   return buf;

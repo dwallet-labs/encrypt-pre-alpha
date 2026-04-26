@@ -57,10 +57,11 @@ function findPda(seeds: (Buffer | Uint8Array)[], pid: PublicKey): [PublicKey, nu
   return PublicKey.findProgramAddressSync(seeds, pid);
 }
 
-function mockCiphertext(value: bigint): Uint8Array {
-  const buf = new Uint8Array(16);
+function mockCiphertext(value: bigint, fheType: number): Uint8Array {
+  const buf = new Uint8Array(17);
+  buf[0] = fheType;
   let v = value;
-  for (let i = 0; i < 16; i++) { buf[i] = Number(v & 0xffn); v >>= 8n; }
+  for (let i = 0; i < 16; i++) { buf[1 + i] = Number(v & 0xffn); v >>= 8n; }
   return buf;
 }
 
@@ -191,7 +192,7 @@ async function houseJoinAndResolve(gamePdaStr: string) {
     const houseVal = Math.random() < 0.5 ? 0 : 1;
     const { ciphertextIdentifiers } = await encryptClient.createInput({
       chain: Chain.Solana,
-      inputs: [{ ciphertextBytes: mockCiphertext(BigInt(houseVal)), fheType: FHE_UINT64 }],
+      inputs: [{ ciphertextBytes: mockCiphertext(BigInt(houseVal), FHE_UINT64), fheType: FHE_UINT64 }],
       authorized: COINFLIP_PROGRAM.toBytes(),
       networkEncryptionPublicKey: networkKey,
     });

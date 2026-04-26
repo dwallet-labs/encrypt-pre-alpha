@@ -237,7 +237,7 @@ function VotingApp() {
       const grpcClient = createEncryptWebClient(GRPC_URL);
       const ids = await grpcClient.createInput({
         chain: Chain.SOLANA,
-        inputs: [{ ciphertextBytes: encryptValue(voteVal), fheType: 0 }],
+        inputs: [{ ciphertextBytes: encryptValue(voteVal, 0), fheType: 0 }],
         authorized: VOTING_PROGRAM.toBytes(),
         networkEncryptionPublicKey: NETWORK_KEY,
       });

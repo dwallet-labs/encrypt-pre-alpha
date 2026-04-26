@@ -78,12 +78,18 @@ export const isDecrypted = (d: Buffer) => {
 
 // ── Mock ciphertext ──
 
-/** Encode a mock plaintext value as little-endian u128 bytes for dev mode. */
-export function mockCiphertext(value: bigint): Uint8Array {
-  const buf = new Uint8Array(16);
+/**
+ * Encode a mock plaintext value for dev mode as the executor's legacy 17-byte
+ * format: [fhe_type(1) || value_le(16)]. The type tag is required — without it
+ * the executor falls into a fallback that misreads multi-byte scalars
+ * (e.g. EUint64 returns value >> 8).
+ */
+export function mockCiphertext(value: bigint, fheType: number): Uint8Array {
+  const buf = new Uint8Array(17);
+  buf[0] = fheType;
   let v = value;
   for (let i = 0; i < 16; i++) {
-    buf[i] = Number(v & 0xffn);
+    buf[1 + i] = Number(v & 0xffn);
     v >>= 8n;
   }
   return buf;

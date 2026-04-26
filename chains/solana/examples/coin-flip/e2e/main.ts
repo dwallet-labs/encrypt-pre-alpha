@@ -55,7 +55,7 @@ async function main() {
 
   const { ciphertextIdentifiers: sideAIds } = await encrypt.createInput({
     chain: Chain.Solana,
-    inputs: [{ ciphertextBytes: mockCiphertext(sideAValue), fheType: FHE_UINT64 }],
+    inputs: [{ ciphertextBytes: mockCiphertext(sideAValue, FHE_UINT64), fheType: FHE_UINT64 }],
     authorized: COINFLIP_PROGRAM.toBytes(),
     networkEncryptionPublicKey: enc.networkKey,
   });
@@ -77,7 +77,7 @@ async function main() {
 
   const { ciphertextIdentifiers: sideBIds } = await encrypt.createInput({
     chain: Chain.Solana,
-    inputs: [{ ciphertextBytes: mockCiphertext(sideBValue), fheType: FHE_UINT64 }],
+    inputs: [{ ciphertextBytes: mockCiphertext(sideBValue, FHE_UINT64), fheType: FHE_UINT64 }],
     authorized: COINFLIP_PROGRAM.toBytes(),
     networkEncryptionPublicKey: enc.networkKey,
   });

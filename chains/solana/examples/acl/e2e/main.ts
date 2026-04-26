@@ -47,7 +47,7 @@ async function grantOrRevoke(
   log("2/6", `${label}...`);
   const { ciphertextIdentifiers } = await encrypt.createInput({
     chain: Chain.Solana,
-    inputs: [{ ciphertextBytes: mockCiphertext(value), fheType: FHE_UINT64 }],
+    inputs: [{ ciphertextBytes: mockCiphertext(value, FHE_UINT64), fheType: FHE_UINT64 }],
     authorized: ACL_PROGRAM.toBytes(),
     networkEncryptionPublicKey: ctx.enc.networkKey,
   });
@@ -77,7 +77,7 @@ async function checkPermission(
 
   const { ciphertextIdentifiers } = await encrypt.createInput({
     chain: Chain.Solana,
-    inputs: [{ ciphertextBytes: mockCiphertext(permValue), fheType: FHE_UINT64 }],
+    inputs: [{ ciphertextBytes: mockCiphertext(permValue, FHE_UINT64), fheType: FHE_UINT64 }],
     authorized: ACL_PROGRAM.toBytes(),
     networkEncryptionPublicKey: ctx.enc.networkKey,
   });
