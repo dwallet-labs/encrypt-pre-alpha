@@ -279,8 +279,8 @@ impl FheType {
 /// FHE operation identifiers.
 ///
 /// Discriminant ranges: arithmetic 0–15, boolean 20–32, comparison 40–51,
-/// conditional 60–61, random 70–71, conversion 80–86, vector 90–95,
-/// key management 100–104.
+/// conditional 60–61, random 70–71, conversion 80–86, cross-entry 90–99,
+/// key management 100–104, reductions 110–114.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum FheOperation {
@@ -350,20 +350,31 @@ pub enum FheOperation {
     ExtractMsbs = 84,
     Bootstrap = 85,
     ThinBootstrap = 86,
-    // ── Vector — Core ──
+    // ── Cross-Entry — Core ──
     Gather = 90,
-    // ── Vector — Convenience ──
+    RotateEntries = 96,
+    LinearTransform = 97,
+    // ── Cross-Entry — Convenience ──
     Scatter = 91,
     Assign = 92,
     AssignScalars = 93,
     Copy = 94,
     Get = 95,
+    LinearTransformPlaintext = 98,
+    LinearTransformBand = 99,
     // ── Key Management — Core ──
     From = 100,
     Encrypt = 101,
     Decrypt = 102,
     KeySwitch = 103,
     ReEncrypt = 104,
+    // ── Reductions — Core ──
+    ReduceAdd = 110,
+    // ── Reductions — Convenience ──
+    ReduceMin = 111,
+    ReduceMax = 112,
+    ReduceAny = 113,
+    ReduceAll = 114,
 }
 
 impl FheOperation {
@@ -386,18 +397,34 @@ impl FheOperation {
                 | Self::ToBoolean
                 | Self::Bootstrap
                 | Self::ThinBootstrap
+                | Self::ReduceAdd
+                | Self::ReduceMin
+                | Self::ReduceMax
+                | Self::ReduceAny
+                | Self::ReduceAll
         )
+    }
+
+    /// Returns `true` for reduction operations (discriminants 110–114).
+    pub fn is_reduction(&self) -> bool {
+        let d = *self as u8;
+        (110..=114).contains(&d)
     }
 
     /// Infer the result [`FheType`] from the input type.
     ///
     /// Most operations preserve the input type.
     /// `ToBoolean` always returns `EBool`.
+    /// `ReduceAdd/Min/Max` collapse a vector to its scalar element type.
+    /// `ReduceAny/All` always return `EBool`.
     /// Operations like `Into` depend on an external target type; this method
     /// returns `input_type` as a conservative default.
     pub fn result_type(&self, input_type: FheType) -> FheType {
         match self {
-            Self::ToBoolean => FheType::EBool,
+            Self::ToBoolean | Self::ReduceAny | Self::ReduceAll => FheType::EBool,
+            Self::ReduceAdd | Self::ReduceMin | Self::ReduceMax => {
+                input_type.scalar_element_type()
+            }
             _ => input_type,
         }
     }
@@ -486,8 +513,20 @@ mod tests {
         assert!(FheOperation::Not.is_unary());
         assert!(FheOperation::ToBoolean.is_unary());
         assert!(FheOperation::Bootstrap.is_unary());
+        assert!(FheOperation::ReduceAdd.is_unary());
+        assert!(FheOperation::ReduceAny.is_unary());
         assert!(!FheOperation::Add.is_unary());
         assert!(!FheOperation::Select.is_unary());
+        assert!(!FheOperation::RotateEntries.is_unary());
+    }
+
+    #[test]
+    fn is_reduction() {
+        assert!(FheOperation::ReduceAdd.is_reduction());
+        assert!(FheOperation::ReduceMin.is_reduction());
+        assert!(FheOperation::ReduceAll.is_reduction());
+        assert!(!FheOperation::Add.is_reduction());
+        assert!(!FheOperation::Gather.is_reduction());
     }
 
     #[test]
@@ -500,12 +539,36 @@ mod tests {
             FheOperation::IsEqual.result_type(FheType::EUint64),
             FheType::EUint64
         );
+        assert_eq!(
+            FheOperation::RotateEntries.result_type(FheType::EVectorU64),
+            FheType::EVectorU64
+        );
     }
 
     #[test]
     fn result_type_to_boolean() {
         assert_eq!(
             FheOperation::ToBoolean.result_type(FheType::EUint128),
+            FheType::EBool
+        );
+    }
+
+    #[test]
+    fn result_type_reductions() {
+        assert_eq!(
+            FheOperation::ReduceAdd.result_type(FheType::EVectorU32),
+            FheType::EUint32
+        );
+        assert_eq!(
+            FheOperation::ReduceMin.result_type(FheType::EVectorU64),
+            FheType::EUint64
+        );
+        assert_eq!(
+            FheOperation::ReduceAny.result_type(FheType::EVectorU32),
+            FheType::EBool
+        );
+        assert_eq!(
+            FheOperation::ReduceAll.result_type(FheType::EBitVector256),
             FheType::EBool
         );
     }

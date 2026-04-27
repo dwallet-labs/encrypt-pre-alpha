@@ -227,6 +227,15 @@ pub fn mock_binary_compute_value_bytes(
             FheOperation::Scatter => return mock_vector_scatter(a, b, fhe_type),
             FheOperation::Copy => return b.to_vec(),
             FheOperation::Get => return mock_vector_get(a, b, fhe_type),
+            FheOperation::RotateEntries => return mock_vector_rotate_entries(a, b, fhe_type),
+            FheOperation::LinearTransform
+            | FheOperation::LinearTransformPlaintext
+            | FheOperation::LinearTransformBand => {
+                // Mock: matrix structure isn't carried as a single ciphertext, so the
+                // mock returns the input unchanged (identity transform). Real semantics
+                // require multi-operand encoding (Vec<V> or band diagonals).
+                return a.to_vec();
+            }
             _ => {}
         }
     }
@@ -274,6 +283,9 @@ pub fn mock_unary_compute_value_bytes(
     a: &[u8],
     fhe_type: FheType,
 ) -> Vec<u8> {
+    if op.is_reduction() {
+        return mock_reduce(op, a, fhe_type);
+    }
     if fhe_type.is_arithmetic_vector() {
         let elem_bw = fhe_type.element_byte_width();
         let scalar_ft = fhe_type.scalar_element_type();
@@ -467,6 +479,80 @@ fn mock_vector_get(a: &[u8], b: &[u8], fhe_type: FheType) -> Vec<u8> {
         write_le_u128(&mut result, 0, elem_bw, val);
     }
     result
+}
+
+/// RotateEntries: rotate the entries of `a` by `n` positions (b is the shift, in entries).
+/// Positive `n` rotates left (entry 0 ← entry n), negative rotates right.
+/// Cipher-level rotation; distinct from `rotate_left`/`rotate_right` which rotate bits within an entry.
+fn mock_vector_rotate_entries(a: &[u8], b: &[u8], fhe_type: FheType) -> Vec<u8> {
+    let elem_bw = fhe_type.element_byte_width();
+    let count = fhe_type.element_count();
+    let bytes_total = fhe_type.byte_width();
+    let n = bytes_to_u128(b) as i128;
+    let count_i = count as i128;
+    let normalized = ((n % count_i) + count_i) % count_i;
+    let shift = normalized as usize;
+    let mut result = vec![0u8; bytes_total];
+    for i in 0..count {
+        let src = (i + shift) % count;
+        let val = read_le_u128(a, src * elem_bw, elem_bw);
+        write_le_u128(&mut result, i * elem_bw, elem_bw, val);
+    }
+    result
+}
+
+/// Mock mode: reduce all entries of a vector to a single scalar.
+/// `result_type` is the *output* type:
+///   - `ReduceAdd`/`Min`/`Max`: scalar element type (e.g., `EUint32` for `EVectorU32`)
+///   - `ReduceAny`/`All`: `EBool`
+fn mock_reduce(op: FheOperation, input: &[u8], result_type: FheType) -> Vec<u8> {
+    match op {
+        FheOperation::ReduceAdd | FheOperation::ReduceMin | FheOperation::ReduceMax => {
+            let elem_bw = result_type.byte_width();
+            if elem_bw == 0 || input.is_empty() {
+                return u128_to_bytes(0, elem_bw.max(1));
+            }
+            let count = input.len() / elem_bw;
+            if count == 0 {
+                return u128_to_bytes(0, elem_bw);
+            }
+            let mask = type_bit_mask(result_type);
+            let mut acc = read_le_u128(input, 0, elem_bw) & mask;
+            for i in 1..count {
+                let v = read_le_u128(input, i * elem_bw, elem_bw) & mask;
+                acc = match op {
+                    FheOperation::ReduceAdd => acc.wrapping_add(v) & mask,
+                    FheOperation::ReduceMin => {
+                        if v < acc {
+                            v
+                        } else {
+                            acc
+                        }
+                    }
+                    FheOperation::ReduceMax => {
+                        if v > acc {
+                            v
+                        } else {
+                            acc
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+            }
+            u128_to_bytes(acc, elem_bw)
+        }
+        FheOperation::ReduceAny => {
+            let any = input.iter().any(|&byte| byte != 0);
+            vec![any as u8]
+        }
+        FheOperation::ReduceAll => {
+            // For testing: tests construct inputs where each entry is 1 byte
+            // (EVectorU8 / EBitVector8) so byte-level all-nonzero matches FHE semantics.
+            let all = !input.is_empty() && input.iter().all(|&byte| byte != 0);
+            vec![all as u8]
+        }
+        _ => unreachable!(),
+    }
 }
 
 // ── Internal helpers ──

@@ -16,6 +16,13 @@ pub trait Arithmetic: Sized {
     fn min(&self, other: &Self) -> Self;
     fn max(&self, other: &Self) -> Self;
     fn blend(&self, a: &Self, b: &Self) -> Self;
+    fn add_scalar<S: Sized>(&self, s: &S) -> Self;
+    fn multiply_scalar<S: Sized>(&self, s: &S) -> Self;
+    fn subtract_scalar<S: Sized>(&self, s: &S) -> Self;
+    fn divide_scalar<S: Sized>(&self, s: &S) -> Self;
+    fn modulo_scalar<S: Sized>(&self, s: &S) -> Self;
+    fn min_scalar<S: Sized>(&self, s: &S) -> Self;
+    fn max_scalar<S: Sized>(&self, s: &S) -> Self;
 }
 
 /// Boolean / bitwise operations.
@@ -30,6 +37,9 @@ pub trait Boolean: Sized {
     fn shift_right(&self, n: &Self) -> Self;
     fn rotate_left(&self, n: &Self) -> Self;
     fn rotate_right(&self, n: &Self) -> Self;
+    fn and_scalar<S: Sized>(&self, mask: &S) -> Self;
+    fn or_scalar<S: Sized>(&self, mask: &S) -> Self;
+    fn xor_scalar<S: Sized>(&self, mask: &S) -> Self;
 }
 
 /// Comparison operations — return same type with 0/1 value.
@@ -40,6 +50,12 @@ pub trait Comparison: Sized {
     fn is_greater_than(&self, other: &Self) -> Self;
     fn is_greater_or_equal(&self, other: &Self) -> Self;
     fn is_less_or_equal(&self, other: &Self) -> Self;
+    fn is_less_than_scalar<S: Sized>(&self, s: &S) -> Self;
+    fn is_equal_scalar<S: Sized>(&self, s: &S) -> Self;
+    fn is_not_equal_scalar<S: Sized>(&self, s: &S) -> Self;
+    fn is_greater_than_scalar<S: Sized>(&self, s: &S) -> Self;
+    fn is_greater_or_equal_scalar<S: Sized>(&self, s: &S) -> Self;
+    fn is_less_or_equal_scalar<S: Sized>(&self, s: &S) -> Self;
 }
 
 /// Conditional select.
@@ -61,6 +77,28 @@ pub trait VectorOps: Sized {
     fn assign(&self, indices: &Self, values: &Self) -> Self;
     fn copy(&self, src: &Self) -> Self;
     fn get(&self, indices: &Self) -> Self;
+}
+
+/// Cross-entry vector operations (cipher-level rotation, distinct from bitwise rotate).
+pub trait CrossEntry: Sized {
+    fn rotate_entries<S: Sized>(&self, n: &S) -> Self;
+}
+
+/// Linear-algebra operations on vectors.
+pub trait LinearAlgebra: Sized {
+    fn linear_transform<M: Sized>(&self, matrix: &M) -> Self;
+    fn linear_transform_band<M: Sized>(&self, diagonals: &M) -> Self;
+}
+
+/// Reduction operations: aggregate all entries of a vector into a scalar.
+/// Return type is `Self` here as a placeholder; the macro rewrites to the
+/// vector's scalar element type (or `EBool` for `reduce_any`/`reduce_all`).
+pub trait Reduction: Sized {
+    fn reduce_add(&self) -> Self;
+    fn reduce_min(&self) -> Self;
+    fn reduce_max(&self) -> Self;
+    fn reduce_any(&self) -> Self;
+    fn reduce_all(&self) -> Self;
 }
 
 // ── Blanket impls for Encrypted<T> ──
@@ -99,6 +137,27 @@ impl<T: EncryptedType> Arithmetic for Encrypted<T> {
     fn blend(&self, _: &Self, _: &Self) -> Self {
         panic_stub!()
     }
+    fn add_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn multiply_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn subtract_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn divide_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn modulo_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn min_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn max_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
 }
 
 impl<T: EncryptedType> Boolean for Encrypted<T> {
@@ -132,6 +191,15 @@ impl<T: EncryptedType> Boolean for Encrypted<T> {
     fn rotate_right(&self, _: &Self) -> Self {
         panic_stub!()
     }
+    fn and_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn or_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn xor_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
 }
 
 impl<T: EncryptedType> Comparison for Encrypted<T> {
@@ -151,6 +219,24 @@ impl<T: EncryptedType> Comparison for Encrypted<T> {
         panic_stub!()
     }
     fn is_less_or_equal(&self, _: &Self) -> Self {
+        panic_stub!()
+    }
+    fn is_less_than_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_equal_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_not_equal_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_greater_than_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_greater_or_equal_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_less_or_equal_scalar<S: Sized>(&self, _: &S) -> Self {
         panic_stub!()
     }
 }
@@ -203,6 +289,27 @@ impl<const F: u8, T: EncryptedType, const N: usize> Arithmetic for EncryptedVect
     fn blend(&self, _: &Self, _: &Self) -> Self {
         panic_stub!()
     }
+    fn add_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn multiply_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn subtract_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn divide_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn modulo_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn min_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn max_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
 }
 
 impl<const F: u8, T: EncryptedType, const N: usize> Boolean for EncryptedVector<F, T, N> {
@@ -236,6 +343,15 @@ impl<const F: u8, T: EncryptedType, const N: usize> Boolean for EncryptedVector<
     fn rotate_right(&self, _: &Self) -> Self {
         panic_stub!()
     }
+    fn and_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn or_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn xor_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
 }
 
 impl<const F: u8, T: EncryptedType, const N: usize> Comparison for EncryptedVector<F, T, N> {
@@ -255,6 +371,24 @@ impl<const F: u8, T: EncryptedType, const N: usize> Comparison for EncryptedVect
         panic_stub!()
     }
     fn is_less_or_equal(&self, _: &Self) -> Self {
+        panic_stub!()
+    }
+    fn is_less_than_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_equal_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_not_equal_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_greater_than_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_greater_or_equal_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_less_or_equal_scalar<S: Sized>(&self, _: &S) -> Self {
         panic_stub!()
     }
 }
@@ -285,6 +419,39 @@ impl<const F: u8, T: EncryptedType, const N: usize> VectorOps for EncryptedVecto
         panic_stub!()
     }
     fn get(&self, _: &Self) -> Self {
+        panic_stub!()
+    }
+}
+
+impl<const F: u8, T: EncryptedType, const N: usize> CrossEntry for EncryptedVector<F, T, N> {
+    fn rotate_entries<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+}
+
+impl<const F: u8, T: EncryptedType, const N: usize> LinearAlgebra for EncryptedVector<F, T, N> {
+    fn linear_transform<M: Sized>(&self, _: &M) -> Self {
+        panic_stub!()
+    }
+    fn linear_transform_band<M: Sized>(&self, _: &M) -> Self {
+        panic_stub!()
+    }
+}
+
+impl<const F: u8, T: EncryptedType, const N: usize> Reduction for EncryptedVector<F, T, N> {
+    fn reduce_add(&self) -> Self {
+        panic_stub!()
+    }
+    fn reduce_min(&self) -> Self {
+        panic_stub!()
+    }
+    fn reduce_max(&self) -> Self {
+        panic_stub!()
+    }
+    fn reduce_any(&self) -> Self {
+        panic_stub!()
+    }
+    fn reduce_all(&self) -> Self {
         panic_stub!()
     }
 }
@@ -321,6 +488,27 @@ impl<T: EncryptedType, const SIZE: usize> Arithmetic for Plaintext<T, SIZE> {
     fn blend(&self, _: &Self, _: &Self) -> Self {
         panic_stub!()
     }
+    fn add_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn multiply_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn subtract_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn divide_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn modulo_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn min_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn max_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
 }
 
 impl<T: EncryptedType, const SIZE: usize> Boolean for Plaintext<T, SIZE> {
@@ -354,6 +542,15 @@ impl<T: EncryptedType, const SIZE: usize> Boolean for Plaintext<T, SIZE> {
     fn rotate_right(&self, _: &Self) -> Self {
         panic_stub!()
     }
+    fn and_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn or_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn xor_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
 }
 
 impl<T: EncryptedType, const SIZE: usize> Comparison for Plaintext<T, SIZE> {
@@ -373,6 +570,24 @@ impl<T: EncryptedType, const SIZE: usize> Comparison for Plaintext<T, SIZE> {
         panic_stub!()
     }
     fn is_less_or_equal(&self, _: &Self) -> Self {
+        panic_stub!()
+    }
+    fn is_less_than_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_equal_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_not_equal_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_greater_than_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_greater_or_equal_scalar<S: Sized>(&self, _: &S) -> Self {
+        panic_stub!()
+    }
+    fn is_less_or_equal_scalar<S: Sized>(&self, _: &S) -> Self {
         panic_stub!()
     }
 }

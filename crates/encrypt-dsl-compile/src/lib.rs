@@ -231,14 +231,21 @@ pub fn expr(e: &Expr, ctx: &mut Ctx) -> Result<(proc_macro2::TokenStream, u8), s
                 _ => {
                     let base_op = method_op(&mc.method)?;
                     if mc.args.is_empty() {
-                        // 0-arg unary: treat as unary op (result = same type)
+                        // 0-arg unary: result type depends on op.
+                        // Reductions collapse a vector to a scalar (or EBool).
+                        // All other 0-arg ops preserve the receiver type.
+                        let result_tid = match base_op {
+                            110 | 111 | 112 => scalar_element_tid(recv_tid), // ReduceAdd/Min/Max
+                            113 | 114 => 0,                                  // ReduceAny/All -> EBool
+                            _ => recv_tid,
+                        };
                         let tmp = ctx.temp();
                         let ti = format_ident!("{}", tmp);
                         ctx.stmts.push(
-                            quote! { let #ti = __gb.add_op(#base_op, #recv_tid, #recv_tok, 0xFFFFu16); },
+                            quote! { let #ti = __gb.add_op(#base_op, #result_tid, #recv_tok, 0xFFFFu16); },
                         );
-                        ctx.vars.insert(tmp.clone(), recv_tid);
-                        return Ok((quote! { #ti }, recv_tid));
+                        ctx.vars.insert(tmp.clone(), result_tid);
+                        return Ok((quote! { #ti }, result_tid));
                     }
                     let (arg_tok, arg_tid) = expr(&mc.args[0], ctx)?;
                     let op = maybe_scalar_op(base_op, recv_tid, arg_tid);
@@ -797,13 +804,23 @@ fn method_op(ident: &syn::Ident) -> Result<u8, syn::Error> {
         "to_boolean" => Ok(83),
         "bootstrap" => Ok(85),
         "thin_bootstrap" => Ok(86),
-        // Vector (90-95)
+        // Cross-Entry (90-99)
         "gather" => Ok(90),
         "scatter" => Ok(91),
         "assign" => Ok(92),
         "assign_scalars" => Ok(93),
         "copy" => Ok(94),
         "get" => Ok(95),
+        "rotate_entries" => Ok(96),
+        "linear_transform" => Ok(97),
+        "linear_transform_plaintext" => Ok(98),
+        "linear_transform_band" => Ok(99),
+        // Reductions (110-114)
+        "reduce_add" => Ok(110),
+        "reduce_min" => Ok(111),
+        "reduce_max" => Ok(112),
+        "reduce_any" => Ok(113),
+        "reduce_all" => Ok(114),
         _ => Err(syn::Error::new_spanned(
             ident,
             format!("unsupported FHE method `{ident}`"),

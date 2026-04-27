@@ -202,6 +202,45 @@ fn sum_diff_u32_graph(a: EUint32Vector, b: EUint32Vector) -> (EUint32Vector, EUi
 }
 
 // ════════════════════════════════════════════════════════════
+// Cross-Entry & Reduction graphs (REFHE refresh)
+// ════════════════════════════════════════════════════════════
+
+/// Sum of all entries: EUint32Vector → EUint32
+#[encrypt_fn]
+fn reduce_add_u32_graph(a: EUint32Vector) -> EUint32 { a.reduce_add() }
+
+/// Minimum entry: EUint32Vector → EUint32
+#[encrypt_fn]
+fn reduce_min_u32_graph(a: EUint32Vector) -> EUint32 { a.reduce_min() }
+
+/// Maximum entry: EUint32Vector → EUint32
+#[encrypt_fn]
+fn reduce_max_u32_graph(a: EUint32Vector) -> EUint32 { a.reduce_max() }
+
+/// Any entry nonzero: EUint8Vector → EBool
+#[encrypt_fn]
+fn reduce_any_u8_graph(a: EUint8Vector) -> EBool { a.reduce_any() }
+
+/// All entries nonzero: EUint8Vector → EBool (byte-level under mock semantics)
+#[encrypt_fn]
+fn reduce_all_u8_graph(a: EUint8Vector) -> EBool { a.reduce_all() }
+
+/// Rotate entries (cipher-position rotation, distinct from bitwise rotate_left/right).
+/// `n` is encrypted u32 in the same scalar element type as the vector.
+#[encrypt_fn]
+fn rotate_entries_u32_graph(a: EUint32Vector, n: EUint32) -> EUint32Vector {
+    a.rotate_entries(&n)
+}
+
+/// Composition: max(v) - min(v) — exercises chained reductions + binary scalar op
+#[encrypt_fn]
+fn range_u32_graph(a: EUint32Vector) -> EUint32 {
+    let mx = a.reduce_max();
+    let mn = a.reduce_min();
+    mx - mn
+}
+
+// ════════════════════════════════════════════════════════════
 // EUint8Vector graphs
 // ════════════════════════════════════════════════════════════
 
@@ -281,6 +320,14 @@ fn process_instruction(
         // u128 ops
         Some((&40, rest)) => exec_binary(accounts, rest, |ctx, a, b, o| ctx.add_u128_graph(a, b, o)),
         Some((&41, rest)) => exec_unary(accounts, rest, |ctx, a, o| ctx.mul_scalar_u128_graph(a, o)),
+        // Reductions & cross-entry (REFHE refresh)
+        Some((&70, rest)) => exec_unary(accounts, rest, |ctx, a, o| ctx.reduce_add_u32_graph(a, o)),
+        Some((&71, rest)) => exec_unary(accounts, rest, |ctx, a, o| ctx.reduce_min_u32_graph(a, o)),
+        Some((&72, rest)) => exec_unary(accounts, rest, |ctx, a, o| ctx.reduce_max_u32_graph(a, o)),
+        Some((&73, rest)) => exec_unary(accounts, rest, |ctx, a, o| ctx.reduce_any_u8_graph(a, o)),
+        Some((&74, rest)) => exec_unary(accounts, rest, |ctx, a, o| ctx.reduce_all_u8_graph(a, o)),
+        Some((&75, rest)) => exec_binary(accounts, rest, |ctx, a, n, o| ctx.rotate_entries_u32_graph(a, n, o)),
+        Some((&76, rest)) => exec_unary(accounts, rest, |ctx, a, o| ctx.range_u32_graph(a, o)),
         // utility: make_public via CPI
         Some((&99, rest)) => exec_make_public(accounts, rest),
         _ => Err(ProgramError::InvalidInstructionData),

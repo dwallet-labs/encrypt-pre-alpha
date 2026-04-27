@@ -42,6 +42,15 @@ use solana_sdk::signer::Signer;
 
 #[encrypt_fn] fn add_u8_graph(a: EUint8Vector, b: EUint8Vector) -> EUint8Vector { a + b }
 #[encrypt_fn] fn mul_scalar_u8_graph(a: EUint8Vector) -> EUint8Vector { a * 2 }
+
+// Cross-Entry & Reduction graphs (REFHE refresh)
+#[encrypt_fn] fn reduce_add_u32_graph(a: EUint32Vector) -> EUint32 { a.reduce_add() }
+#[encrypt_fn] fn reduce_min_u32_graph(a: EUint32Vector) -> EUint32 { a.reduce_min() }
+#[encrypt_fn] fn reduce_max_u32_graph(a: EUint32Vector) -> EUint32 { a.reduce_max() }
+#[encrypt_fn] fn reduce_any_u8_graph(a: EUint8Vector) -> EBool { a.reduce_any() }
+#[encrypt_fn] fn reduce_all_u8_graph(a: EUint8Vector) -> EBool { a.reduce_all() }
+#[encrypt_fn] fn rotate_entries_u32_graph(a: EUint32Vector, n: EUint32) -> EUint32Vector { a.rotate_entries(&n) }
+#[encrypt_fn] fn range_u32_graph(a: EUint32Vector) -> EUint32 { let mx = a.reduce_max(); let mn = a.reduce_min(); mx - mn }
 #[encrypt_fn] fn add_u64_graph(a: EUint64Vector, b: EUint64Vector) -> EUint64Vector { a + b }
 #[encrypt_fn] fn mul_scalar_u64_graph(a: EUint64Vector) -> EUint64Vector { a * 7 }
 #[encrypt_fn] fn add_u128_graph(a: EUint128Vector, b: EUint128Vector) -> EUint128Vector { a + b }
@@ -594,4 +603,181 @@ fn e2e_multi_sum_diff_dual_output() {
     assert_eq!(read_u32(&sum, 1), 35, "30+5=35");
     assert_eq!(read_u32(&diff, 0), 40, "50-10=40");
     assert_eq!(read_u32(&diff, 1), 25, "30-5=25");
+}
+
+// ════════════════════════════════════════════════════════════
+// Cross-Entry & Reductions — E2E (REFHE refresh)
+// ════════════════════════════════════════════════════════════
+
+/// Reduction E2E: vector input → scalar output. The output ciphertext is allocated
+/// with the scalar `out_type`, the graph carries the result-type re-tagging.
+fn run_reduce_e2e(
+    ctx: &mut EncryptTestContext,
+    pid: &Pubkey, cpi: &Pubkey, cpi_bump: u8,
+    disc: u8,
+    graph_fn: fn() -> Vec<u8>,
+    in_type: FheType, out_type: FheType,
+    a_bytes: &[u8],
+) -> Vec<u8> {
+    let a_pk = ctx.create_input_bytes(in_type, a_bytes, pid);
+    let r_pk = ctx.create_input_bytes(out_type, &vec![0u8; out_type.byte_width()], pid);
+
+    let mut accts = vec![
+        AccountMeta::new(a_pk, false),
+        AccountMeta::new(r_pk, false),
+    ];
+    accts.extend(encrypt_accounts(pid, ctx, cpi));
+
+    let ix = Instruction::new_with_bytes(*pid, &[disc, cpi_bump], accts);
+    ctx.send_transaction(&[ix], &[]);
+
+    let graph = graph_fn();
+    ctx.enqueue_graph_execution(&graph, &[a_pk], &[r_pk]);
+    ctx.process_pending();
+    ctx.register_ciphertext(&r_pk);
+    ctx.decrypt_bytes(&r_pk)
+}
+
+#[test]
+fn e2e_reduce_add_u32() {
+    let mut ctx = EncryptTestContext::new_default();
+    let (pid, cpi, bump) = setup(&mut ctx);
+    let r = run_reduce_e2e(
+        &mut ctx, &pid, &cpi, bump, 70, reduce_add_u32_graph,
+        FheType::EVectorU32, FheType::EUint32,
+        &make_u32_vec(&[10, 20, 30, 40, 50]),
+    );
+    let sum = u32::from_le_bytes(r[..4].try_into().unwrap());
+    assert_eq!(sum, 150, "reduce_add over [10,20,30,40,50] = 150");
+}
+
+#[test]
+fn e2e_reduce_min_u32() {
+    let mut ctx = EncryptTestContext::new_default();
+    let (pid, cpi, bump) = setup(&mut ctx);
+    // Reductions span all 2048 entries; fill every slot so unused positions
+    // don't dominate the min.
+    let mut values = vec![100u32; 2048];
+    values[5] = 7;
+    values[1000] = 3;
+    let r = run_reduce_e2e(
+        &mut ctx, &pid, &cpi, bump, 71, reduce_min_u32_graph,
+        FheType::EVectorU32, FheType::EUint32,
+        &make_u32_vec(&values),
+    );
+    let min = u32::from_le_bytes(r[..4].try_into().unwrap());
+    assert_eq!(min, 3, "reduce_min should find smallest");
+}
+
+#[test]
+fn e2e_reduce_max_u32() {
+    let mut ctx = EncryptTestContext::new_default();
+    let (pid, cpi, bump) = setup(&mut ctx);
+    let r = run_reduce_e2e(
+        &mut ctx, &pid, &cpi, bump, 72, reduce_max_u32_graph,
+        FheType::EVectorU32, FheType::EUint32,
+        &make_u32_vec(&[1, 5, 999, 42, 7]),
+    );
+    let max = u32::from_le_bytes(r[..4].try_into().unwrap());
+    assert_eq!(max, 999, "reduce_max should find largest");
+}
+
+#[test]
+fn e2e_reduce_any_finds_nonzero() {
+    let mut ctx = EncryptTestContext::new_default();
+    let (pid, cpi, bump) = setup(&mut ctx);
+    let mut bytes = vec![0u8; 8192];
+    bytes[3000] = 1; // single nonzero buried in zeros
+    let r = run_reduce_e2e(
+        &mut ctx, &pid, &cpi, bump, 73, reduce_any_u8_graph,
+        FheType::EVectorU8, FheType::EBool,
+        &bytes,
+    );
+    assert_eq!(r[0], 1, "reduce_any over a vector with any nonzero → 1");
+}
+
+#[test]
+fn e2e_reduce_any_all_zero() {
+    let mut ctx = EncryptTestContext::new_default();
+    let (pid, cpi, bump) = setup(&mut ctx);
+    let r = run_reduce_e2e(
+        &mut ctx, &pid, &cpi, bump, 73, reduce_any_u8_graph,
+        FheType::EVectorU8, FheType::EBool,
+        &vec![0u8; 8192],
+    );
+    assert_eq!(r[0], 0, "reduce_any over all-zero vector → 0");
+}
+
+#[test]
+fn e2e_reduce_all_nonzero() {
+    let mut ctx = EncryptTestContext::new_default();
+    let (pid, cpi, bump) = setup(&mut ctx);
+    let r = run_reduce_e2e(
+        &mut ctx, &pid, &cpi, bump, 74, reduce_all_u8_graph,
+        FheType::EVectorU8, FheType::EBool,
+        &vec![1u8; 8192],
+    );
+    assert_eq!(r[0], 1, "reduce_all over all-nonzero → 1");
+}
+
+#[test]
+fn e2e_reduce_all_with_zero() {
+    let mut ctx = EncryptTestContext::new_default();
+    let (pid, cpi, bump) = setup(&mut ctx);
+    let mut bytes = vec![1u8; 8192];
+    bytes[42] = 0;
+    let r = run_reduce_e2e(
+        &mut ctx, &pid, &cpi, bump, 74, reduce_all_u8_graph,
+        FheType::EVectorU8, FheType::EBool,
+        &bytes,
+    );
+    assert_eq!(r[0], 0, "reduce_all when one entry is zero → 0");
+}
+
+#[test]
+fn e2e_rotate_entries_u32() {
+    let mut ctx = EncryptTestContext::new_default();
+    let (pid, cpi, bump) = setup(&mut ctx);
+    let ft = FheType::EVectorU32;
+    let a_pk = ctx.create_input_bytes(ft, &make_u32_vec(&[10, 20, 30, 40, 50]), &pid);
+    // Rotate amount: 1 entry. Stored as encrypted EUint32 scalar.
+    let n_pk = ctx.create_input_bytes(FheType::EUint32, &1u32.to_le_bytes(), &pid);
+    let r_pk = ctx.create_input_bytes(ft, &vec![0u8; 8192], &pid);
+
+    let mut accts = vec![
+        AccountMeta::new(a_pk, false),
+        AccountMeta::new(n_pk, false),
+        AccountMeta::new(r_pk, false),
+    ];
+    accts.extend(encrypt_accounts(&pid, &ctx, &cpi));
+    ctx.send_transaction(&[Instruction::new_with_bytes(pid, &[75, bump], accts)], &[]);
+
+    ctx.enqueue_graph_execution(&rotate_entries_u32_graph(), &[a_pk, n_pk], &[r_pk]);
+    ctx.process_pending();
+    ctx.register_ciphertext(&r_pk);
+    let r = ctx.decrypt_bytes(&r_pk);
+
+    // Rotate left by 1 → out[i] = in[i+1]
+    assert_eq!(read_u32(&r, 0), 20);
+    assert_eq!(read_u32(&r, 1), 30);
+    assert_eq!(read_u32(&r, 2), 40);
+    assert_eq!(read_u32(&r, 3), 50);
+    assert_eq!(read_u32(&r, 4), 0); // wraps to zero region
+}
+
+#[test]
+fn e2e_range_pipeline() {
+    // Composition: max(v) - min(v) — chained reductions through one graph.
+    let mut ctx = EncryptTestContext::new_default();
+    let (pid, cpi, bump) = setup(&mut ctx);
+    let mut values = vec![50u32; 2048];
+    values[7] = 99;
+    values[300] = 2;
+    let r = run_reduce_e2e(
+        &mut ctx, &pid, &cpi, bump, 76, range_u32_graph,
+        FheType::EVectorU32, FheType::EUint32,
+        &make_u32_vec(&values),
+    );
+    let diff = u32::from_le_bytes(r[..4].try_into().unwrap());
+    assert_eq!(diff, 99 - 2, "max - min = 97");
 }
