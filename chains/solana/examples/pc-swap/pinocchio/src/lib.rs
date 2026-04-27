@@ -6,37 +6,33 @@
 /// PC-Swap — Confidential UniV2 AMM that composes with PC-Token via CPI.
 ///
 /// Pool reserves are real PC-Token TokenAccounts owned by the pool PDA.
-/// Each swap / add / remove invokes `pc-token::transfer` via CPI; the
-/// amount ciphertext is moved to pc-token's CPI authority with
-/// `transfer_ciphertext` immediately before the CPI so the encrypt
-/// program accepts pc-token as the authorized party.
-///
-/// Pool also keeps its own encrypted `reserve_a` / `reserve_b` cts which
-/// mirror the vault balances. They are updated in the same FHE graph
-/// that produces the transfer amounts, so a successful swap leaves both
-/// sides consistent. (Limitation: a user who lies about `amount_in` can
-/// drift the mirror — pc-token will silently no-op the underlying SPL
-/// transfer if their balance is short. A snapshot-via-copy mitigation is
-/// noted in the README; for the example we trust honest inputs.)
+/// User → vault deposits go through `pc-token::TransferWithReceipt` (disc 22),
+/// which emits a binary receipt ciphertext (= amount on success, 0 on
+/// insufficient balance). The receipt is authorized to pc-swap and
+/// becomes the *only* trusted input to the FHE math. Reserve mirrors and
+/// payouts are functions of the receipt, never of the user-supplied
+/// `amount_in` directly — so a user who lies about their balance produces
+/// `receipt = 0` and the graph no-ops uniformly: reserves untouched,
+/// vault → user payout = 0.
 ///
 /// ## Instructions
 ///
 /// 0. CreatePool          — init pool PDA, init pc-token vaults (owner = pool)
-/// 1. Swap                — swap_graph + 2× pc-token::transfer
-/// 2. AddLiquidity        — add_liquidity_graph + 2× pc-token::transfer (user → vault)
+/// 1. Swap                — TransferWithReceipt + swap_graph + transfer (vault→user) + close receipt
+/// 2. AddLiquidity        — 2× TransferWithReceipt + add_liquidity_graph + 2× close
 /// 4. RemoveLiquidity     — remove_liquidity_graph + 2× pc-token::transfer (vault → user)
 /// 5. CreateLpPosition    — internal LP balance account
 use encrypt_dsl::prelude::encrypt_fn;
 use encrypt_pinocchio::EncryptContext;
-use encrypt_types::encrypted::Uint64;
 #[allow(unused_imports)]
 use encrypt_types::encrypted::EUint64;
+use encrypt_types::encrypted::Uint64;
 use pinocchio::{
-    cpi::{invoke_signed, Seed, Signer},
+    AccountView, Address, ProgramResult,
+    cpi::{Seed, Signer, invoke_signed},
     entrypoint,
     error::ProgramError,
     instruction::{InstructionAccount, InstructionView},
-    AccountView, Address, ProgramResult,
 };
 use pinocchio_system::instructions::CreateAccount;
 
@@ -50,6 +46,7 @@ pub const PC_TOKEN_ID: Address = Address::new_from_array([5u8; 32]);
 /// PC-Token instruction discriminators we invoke via CPI.
 const PC_TOKEN_IX_INIT_ACCT: u8 = 1;
 const PC_TOKEN_IX_TRANSFER: u8 = 3;
+const PC_TOKEN_IX_TRANSFER_WITH_RECEIPT: u8 = 22;
 
 // ── Account layouts ──
 
@@ -58,11 +55,11 @@ const PC_TOKEN_IX_TRANSFER: u8 = 3;
 pub struct Pool {
     pub mint_a: [u8; 32],
     pub mint_b: [u8; 32],
-    pub vault_a: [u8; 32],          // pc-token TokenAccount (owner = this pool PDA)
-    pub vault_b: [u8; 32],          // pc-token TokenAccount (owner = this pool PDA)
-    pub reserve_a: [u8; 32],        // encrypted reserve mirror (EUint64)
-    pub reserve_b: [u8; 32],        // encrypted reserve mirror (EUint64)
-    pub total_supply: [u8; 32],     // encrypted LP total supply (EUint64)
+    pub vault_a: [u8; 32],      // pc-token TokenAccount (owner = this pool PDA)
+    pub vault_b: [u8; 32],      // pc-token TokenAccount (owner = this pool PDA)
+    pub reserve_a: [u8; 32],    // encrypted reserve mirror (EUint64)
+    pub reserve_b: [u8; 32],    // encrypted reserve mirror (EUint64)
+    pub total_supply: [u8; 32], // encrypted LP total supply (EUint64)
     pub is_initialized: u8,
     pub bump: u8,
 }
@@ -70,11 +67,15 @@ pub struct Pool {
 impl Pool {
     pub const LEN: usize = core::mem::size_of::<Self>();
     pub fn from_bytes(d: &[u8]) -> Result<&Self, ProgramError> {
-        if d.len() < Self::LEN { return Err(ProgramError::InvalidAccountData); }
+        if d.len() < Self::LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
         Ok(unsafe { &*(d.as_ptr() as *const Self) })
     }
     pub fn from_bytes_mut(d: &mut [u8]) -> Result<&mut Self, ProgramError> {
-        if d.len() < Self::LEN { return Err(ProgramError::InvalidAccountData); }
+        if d.len() < Self::LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
         Ok(unsafe { &mut *(d.as_mut_ptr() as *mut Self) })
     }
 }
@@ -85,41 +86,56 @@ impl Pool {
 pub struct LpPosition {
     pub pool: [u8; 32],
     pub owner: [u8; 32],
-    pub balance: [u8; 32],          // encrypted LP balance (EUint64)
+    pub balance: [u8; 32], // encrypted LP balance (EUint64)
     pub bump: u8,
 }
 
 impl LpPosition {
     pub const LEN: usize = core::mem::size_of::<Self>();
     pub fn from_bytes(d: &[u8]) -> Result<&Self, ProgramError> {
-        if d.len() < Self::LEN { return Err(ProgramError::InvalidAccountData); }
+        if d.len() < Self::LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
         Ok(unsafe { &*(d.as_ptr() as *const Self) })
     }
     pub fn from_bytes_mut(d: &mut [u8]) -> Result<&mut Self, ProgramError> {
-        if d.len() < Self::LEN { return Err(ProgramError::InvalidAccountData); }
+        if d.len() < Self::LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
         Ok(unsafe { &mut *(d.as_mut_ptr() as *mut Self) })
     }
 }
 
-fn minimum_balance(s: usize) -> u64 { (s as u64 + 128) * 6960 }
+fn minimum_balance(s: usize) -> u64 {
+    (s as u64 + 128) * 6960
+}
 
 // ── FHE Graphs ──
 
 /// Constant-product swap with 0.3% fee + slippage check.
-/// On slippage failure, returns final_in = final_out = 0 → both pc-token
-/// transfers become no-ops, reserves unchanged.
+///
+/// `receipt` is pc-token's TransferWithReceipt output: it equals `amount_in`
+/// on a successful user→vault deposit, exactly `0` on insufficient balance.
+/// All reserve and payout updates are functions of `receipt`, never of the
+/// user-supplied `amount_in` directly — so a lying user produces `receipt=0`
+/// and every output is 0/no-op uniformly. `amount_in_ct` itself is passed
+/// to pc-token (not pc-swap), so swap_graph cannot read it — `min_amount_out`
+/// (always pc-swap-authorized) provides the typed zero source. On slippage
+/// failure both `final_in` and `final_out` collapse to 0.
 #[encrypt_fn]
 fn swap_graph(
-    reserve_in: EUint64, reserve_out: EUint64,
-    amount_in: EUint64, min_amount_out: EUint64,
+    reserve_in: EUint64,
+    reserve_out: EUint64,
+    receipt: EUint64,
+    min_amount_out: EUint64,
 ) -> (EUint64, EUint64, EUint64, EUint64) {
-    let amount_in_with_fee = amount_in * 997;
+    let amount_in_with_fee = receipt * 997;
     let numer = amount_in_with_fee * reserve_out;
     let denom = (reserve_in * 1000) + amount_in_with_fee;
     let amount_out = numer / denom;
     let slip_ok = amount_out >= min_amount_out;
-    let zero = amount_in - amount_in;
-    let final_in = if slip_ok { amount_in } else { zero };
+    let zero = min_amount_out - min_amount_out;
+    let final_in = if slip_ok { receipt } else { zero };
     let final_out = if slip_ok { amount_out } else { zero };
     let new_reserve_in = reserve_in + final_in;
     let new_reserve_out = reserve_out - final_out;
@@ -127,32 +143,56 @@ fn swap_graph(
 }
 
 /// Add liquidity — updates reserves, total supply, and user LP balance.
-/// First deposit: lp = amount_a (token-A units). Subsequent: proportional.
+///
+/// `receipt_a` / `receipt_b` are pc-token TransferWithReceipt outputs from
+/// the two user→vault deposits (= amount on success, 0 on insufficient).
+/// Reserves and LP updates are functions of the receipts only; if either
+/// deposit no-ops the reserves and LP supply stay consistent.
+///
+/// First deposit: lp = receipt_a. Subsequent: proportional.
 #[encrypt_fn]
 fn add_liquidity_graph(
-    reserve_a: EUint64, reserve_b: EUint64,
+    reserve_a: EUint64,
+    reserve_b: EUint64,
     total_supply: EUint64,
-    amount_a: EUint64, amount_b: EUint64,
+    receipt_a: EUint64,
+    receipt_b: EUint64,
     user_lp: EUint64,
-) -> (EUint64, EUint64, EUint64, EUint64) {
-    let new_reserve_a = reserve_a + amount_a;
-    let new_reserve_b = reserve_b + amount_b;
-    let initial_lp = amount_a;
-    let lp_from_a = (amount_a * total_supply) / (reserve_a + 1);
-    let lp_from_b = (amount_b * total_supply) / (reserve_b + 1);
-    let subsequent_lp = if lp_from_a >= lp_from_b { lp_from_b } else { lp_from_a };
+) -> (EUint64, EUint64, EUint64, EUint64, EUint64, EUint64) {
+    let new_reserve_a = reserve_a + receipt_a;
+    let new_reserve_b = reserve_b + receipt_b;
+    let initial_lp = receipt_a;
+    let lp_from_a = (receipt_a * total_supply) / (reserve_a + 1);
+    let lp_from_b = (receipt_b * total_supply) / (reserve_b + 1);
+    let subsequent_lp = if lp_from_a >= lp_from_b {
+        lp_from_b
+    } else {
+        lp_from_a
+    };
     let is_subsequent = total_supply >= 1;
-    let lp_to_mint = if is_subsequent { subsequent_lp } else { initial_lp };
+    let lp_to_mint = if is_subsequent {
+        subsequent_lp
+    } else {
+        initial_lp
+    };
     let new_total_supply = total_supply + lp_to_mint;
     let new_user_lp = user_lp + lp_to_mint;
-    (new_reserve_a, new_reserve_b, new_total_supply, new_user_lp)
+    (
+        receipt_a,
+        receipt_b,
+        new_reserve_a,
+        new_reserve_b,
+        new_total_supply,
+        new_user_lp,
+    )
 }
 
 /// Remove liquidity — gates on user_lp >= burn. On insufficient LP, all
 /// outputs are 0 → pc-token transfers no-op, reserves unchanged.
 #[encrypt_fn]
 fn remove_liquidity_graph(
-    reserve_a: EUint64, reserve_b: EUint64,
+    reserve_a: EUint64,
+    reserve_b: EUint64,
     total_supply: EUint64,
     burn: EUint64,
     user_lp: EUint64,
@@ -163,9 +203,21 @@ fn remove_liquidity_graph(
     let zero = burn - burn;
     let out_a = if sufficient { amount_a } else { zero };
     let out_b = if sufficient { amount_b } else { zero };
-    let new_ra = if sufficient { reserve_a - out_a } else { reserve_a };
-    let new_rb = if sufficient { reserve_b - out_b } else { reserve_b };
-    let new_supply = if sufficient { total_supply - burn } else { total_supply };
+    let new_ra = if sufficient {
+        reserve_a - out_a
+    } else {
+        reserve_a
+    };
+    let new_rb = if sufficient {
+        reserve_b - out_b
+    } else {
+        reserve_b
+    };
+    let new_supply = if sufficient {
+        total_supply - burn
+    } else {
+        total_supply
+    };
     let new_user_lp = if sufficient { user_lp - burn } else { user_lp };
     (out_a, out_b, new_ra, new_rb, new_supply, new_user_lp)
 }
@@ -173,7 +225,9 @@ fn remove_liquidity_graph(
 // ── Dispatch ──
 
 fn process_instruction(
-    program_id: &Address, accounts: &[AccountView], data: &[u8],
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
 ) -> ProgramResult {
     match data.split_first() {
         Some((&0, rest)) => create_pool(program_id, accounts, rest),
@@ -190,31 +244,110 @@ fn process_instruction(
 /// Build pc-token instruction account list. pc-token's encrypt CPI uses
 /// `pc_token_program` as the caller and `pc_token_cpi_auth` as the cpi_authority.
 fn pc_token_transfer_accounts<'a>(
-    from_acct: &'a AccountView, to_acct: &'a AccountView,
-    from_ct: &'a AccountView, to_ct: &'a AccountView, amt_ct: &'a AccountView,
-    ep: &'a AccountView, cfg: &'a AccountView, dep: &'a AccountView,
-    pc_token_cpi_auth: &'a AccountView, pc_token_program: &'a AccountView,
-    nk: &'a AccountView, owner: &'a AccountView,
-    evt: &'a AccountView, sys: &'a AccountView,
+    from_acct: &'a AccountView,
+    to_acct: &'a AccountView,
+    from_ct: &'a AccountView,
+    to_ct: &'a AccountView,
+    amt_ct: &'a AccountView,
+    ep: &'a AccountView,
+    cfg: &'a AccountView,
+    dep: &'a AccountView,
+    pc_token_cpi_auth: &'a AccountView,
+    pc_token_program: &'a AccountView,
+    nk: &'a AccountView,
+    owner: &'a AccountView,
+    evt: &'a AccountView,
+    sys: &'a AccountView,
 ) -> ([InstructionAccount<'a>; 14], [&'a AccountView; 14]) {
     let metas = [
-        InstructionAccount { address: from_acct.address(), is_writable: true, is_signer: false },
-        InstructionAccount { address: to_acct.address(), is_writable: true, is_signer: false },
-        InstructionAccount { address: from_ct.address(), is_writable: true, is_signer: false },
-        InstructionAccount { address: to_ct.address(), is_writable: true, is_signer: false },
-        InstructionAccount { address: amt_ct.address(), is_writable: true, is_signer: false },
-        InstructionAccount { address: ep.address(), is_writable: false, is_signer: false },
-        InstructionAccount { address: cfg.address(), is_writable: true, is_signer: false },
-        InstructionAccount { address: dep.address(), is_writable: true, is_signer: false },
-        InstructionAccount { address: pc_token_cpi_auth.address(), is_writable: false, is_signer: false },
-        InstructionAccount { address: pc_token_program.address(), is_writable: false, is_signer: false },
-        InstructionAccount { address: nk.address(), is_writable: false, is_signer: false },
+        InstructionAccount {
+            address: from_acct.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: to_acct.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: from_ct.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: to_ct.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: amt_ct.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: ep.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: cfg.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: dep.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: pc_token_cpi_auth.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: pc_token_program.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: nk.address(),
+            is_writable: false,
+            is_signer: false,
+        },
         // owner doubles as `payer` for pc-token's inner encrypt CPI, which marks it writable+signer.
-        InstructionAccount { address: owner.address(), is_writable: true, is_signer: true },
-        InstructionAccount { address: evt.address(), is_writable: false, is_signer: false },
-        InstructionAccount { address: sys.address(), is_writable: false, is_signer: false },
+        InstructionAccount {
+            address: owner.address(),
+            is_writable: true,
+            is_signer: true,
+        },
+        InstructionAccount {
+            address: evt.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: sys.address(),
+            is_writable: false,
+            is_signer: false,
+        },
     ];
-    let views = [from_acct, to_acct, from_ct, to_ct, amt_ct, ep, cfg, dep, pc_token_cpi_auth, pc_token_program, nk, owner, evt, sys];
+    let views = [
+        from_acct,
+        to_acct,
+        from_ct,
+        to_ct,
+        amt_ct,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        owner,
+        evt,
+        sys,
+    ];
     (metas, views)
 }
 
@@ -226,11 +359,158 @@ fn cpi_pc_token_transfer<'a>(
     pool_signer: Option<&[Seed]>,
 ) -> ProgramResult {
     let data = [PC_TOKEN_IX_TRANSFER, pc_token_cpi_auth_bump];
-    let ix = InstructionView { program_id: pc_token_program.address(), data: &data, accounts: metas };
+    let ix = InstructionView {
+        program_id: pc_token_program.address(),
+        data: &data,
+        accounts: metas,
+    };
     match pool_signer {
         Some(seeds) => invoke_signed(&ix, views, &[Signer::from(seeds)]),
         None => invoke_signed(&ix, views, &[]),
     }
+}
+
+/// Build pc-token::TransferWithReceipt account list.
+/// `target_program` becomes the new authorized of the receipt — pass
+/// pc-swap's own program id (the `caller_program` AccountView) so the
+/// receipt can be read by the swap_graph and closed by pc-swap.
+#[allow(clippy::too_many_arguments)]
+fn pc_token_transfer_with_receipt_accounts<'a>(
+    from_acct: &'a AccountView,
+    to_acct: &'a AccountView,
+    from_ct: &'a AccountView,
+    to_ct: &'a AccountView,
+    amt_ct: &'a AccountView,
+    receipt_ct: &'a AccountView,
+    target_program: &'a AccountView,
+    ep: &'a AccountView,
+    cfg: &'a AccountView,
+    dep: &'a AccountView,
+    pc_token_cpi_auth: &'a AccountView,
+    pc_token_program: &'a AccountView,
+    nk: &'a AccountView,
+    owner: &'a AccountView,
+    evt: &'a AccountView,
+    sys: &'a AccountView,
+) -> ([InstructionAccount<'a>; 16], [&'a AccountView; 16]) {
+    let metas = [
+        InstructionAccount {
+            address: from_acct.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: to_acct.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: from_ct.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: to_ct.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: amt_ct.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        // Receipt is a fresh keypair account that the encrypt SDK will create —
+        // outer tx must include the keypair as a signer; we propagate that flag.
+        InstructionAccount {
+            address: receipt_ct.address(),
+            is_writable: true,
+            is_signer: true,
+        },
+        InstructionAccount {
+            address: target_program.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: ep.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: cfg.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: dep.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: pc_token_cpi_auth.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: pc_token_program.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: nk.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: owner.address(),
+            is_writable: true,
+            is_signer: true,
+        },
+        InstructionAccount {
+            address: evt.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: sys.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+    ];
+    let views = [
+        from_acct,
+        to_acct,
+        from_ct,
+        to_ct,
+        amt_ct,
+        receipt_ct,
+        target_program,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        owner,
+        evt,
+        sys,
+    ];
+    (metas, views)
+}
+
+fn cpi_pc_token_transfer_with_receipt<'a>(
+    pc_token_program: &'a AccountView,
+    pc_token_cpi_auth_bump: u8,
+    metas: &[InstructionAccount; 16],
+    views: &[&'a AccountView; 16],
+) -> ProgramResult {
+    let data = [PC_TOKEN_IX_TRANSFER_WITH_RECEIPT, pc_token_cpi_auth_bump];
+    let ix = InstructionView {
+        program_id: pc_token_program.address(),
+        data: &data,
+        accounts: metas,
+    };
+    invoke_signed(&ix, views, &[])
 }
 
 // ── 0: CreatePool ──
@@ -248,19 +528,41 @@ fn cpi_pc_token_transfer<'a>(
 //   nk, payer, evt, sys,
 //
 // Data: [0, pool_bump, vault_a_bump, vault_b_bump, swap_cpi_bump, token_cpi_bump]
-fn create_pool(
-    program_id: &Address, accounts: &[AccountView], data: &[u8],
-) -> ProgramResult {
-    let [pool_acct, mint_a, mint_b, vault_a, vault_b,
-         vault_a_bal_ct, vault_b_bal_ct,
-         ra_ct, rb_ct, ts_ct,
-         ep, cfg, dep, cpi_authority, caller_program,
-         pc_token_cpi_auth, pc_token_program,
-         nk, payer, evt, sys, ..] = accounts
-    else { return Err(ProgramError::NotEnoughAccountKeys); };
+fn create_pool(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [
+        pool_acct,
+        mint_a,
+        mint_b,
+        vault_a,
+        vault_b,
+        vault_a_bal_ct,
+        vault_b_bal_ct,
+        ra_ct,
+        rb_ct,
+        ts_ct,
+        ep,
+        cfg,
+        dep,
+        cpi_authority,
+        caller_program,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        payer,
+        evt,
+        sys,
+        ..,
+    ] = accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
-    if !payer.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
-    if data.len() < 6 { return Err(ProgramError::InvalidInstructionData); }
+    if !payer.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if data.len() < 6 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     let pool_bump = data[0];
     let vault_a_bump = data[1];
     let vault_b_bump = data[2];
@@ -277,29 +579,65 @@ fn create_pool(
         Seed::from(&bb),
     ];
     CreateAccount {
-        from: payer, to: pool_acct, lamports: minimum_balance(Pool::LEN),
-        space: Pool::LEN as u64, owner: program_id,
-    }.invoke_signed(&[Signer::from(&pool_seeds)])?;
+        from: payer,
+        to: pool_acct,
+        lamports: minimum_balance(Pool::LEN),
+        space: Pool::LEN as u64,
+        owner: program_id,
+    }
+    .invoke_signed(&[Signer::from(&pool_seeds)])?;
 
     // 2) CPI pc-token::initialize_account for vault_a (owner = pool_acct PDA)
     cpi_pc_token_init_account(
-        vault_a, mint_a, pool_acct, vault_a_bal_ct,
-        ep, cfg, dep, pc_token_cpi_auth, pc_token_program, nk, payer, evt, sys,
-        pc_token_program, vault_a_bump, token_cpi_bump,
+        vault_a,
+        mint_a,
+        pool_acct,
+        vault_a_bal_ct,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        payer,
+        evt,
+        sys,
+        pc_token_program,
+        vault_a_bump,
+        token_cpi_bump,
     )?;
 
     // 3) CPI pc-token::initialize_account for vault_b
     cpi_pc_token_init_account(
-        vault_b, mint_b, pool_acct, vault_b_bal_ct,
-        ep, cfg, dep, pc_token_cpi_auth, pc_token_program, nk, payer, evt, sys,
-        pc_token_program, vault_b_bump, token_cpi_bump,
+        vault_b,
+        mint_b,
+        pool_acct,
+        vault_b_bal_ct,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        payer,
+        evt,
+        sys,
+        pc_token_program,
+        vault_b_bump,
+        token_cpi_bump,
     )?;
 
     // 4) Create pc-swap's encrypted mirrors (reserve_a, reserve_b, total_supply)
     let ctx = EncryptContext {
-        encrypt_program: ep, config: cfg, deposit: dep,
-        cpi_authority, caller_program, network_encryption_key: nk,
-        payer, event_authority: evt, system_program: sys,
+        encrypt_program: ep,
+        config: cfg,
+        deposit: dep,
+        cpi_authority,
+        caller_program,
+        network_encryption_key: nk,
+        payer,
+        event_authority: evt,
+        system_program: sys,
         cpi_authority_bump: swap_cpi_bump,
     };
     ctx.create_plaintext_typed::<Uint64>(&0u64, ra_ct)?;
@@ -323,48 +661,152 @@ fn create_pool(
 
 #[allow(clippy::too_many_arguments)]
 fn cpi_pc_token_init_account<'a>(
-    ta_acct: &'a AccountView, mint_acct: &'a AccountView, owner: &'a AccountView, bal_ct: &'a AccountView,
-    ep: &'a AccountView, cfg: &'a AccountView, dep: &'a AccountView,
-    pc_token_cpi_auth: &'a AccountView, pc_token_program_caller: &'a AccountView,
-    nk: &'a AccountView, payer: &'a AccountView, evt: &'a AccountView, sys: &'a AccountView,
-    pc_token_program_target: &'a AccountView, ta_bump: u8, token_cpi_bump: u8,
+    ta_acct: &'a AccountView,
+    mint_acct: &'a AccountView,
+    owner: &'a AccountView,
+    bal_ct: &'a AccountView,
+    ep: &'a AccountView,
+    cfg: &'a AccountView,
+    dep: &'a AccountView,
+    pc_token_cpi_auth: &'a AccountView,
+    pc_token_program_caller: &'a AccountView,
+    nk: &'a AccountView,
+    payer: &'a AccountView,
+    evt: &'a AccountView,
+    sys: &'a AccountView,
+    pc_token_program_target: &'a AccountView,
+    ta_bump: u8,
+    token_cpi_bump: u8,
 ) -> ProgramResult {
     let metas = [
-        InstructionAccount { address: ta_acct.address(), is_writable: true, is_signer: false },
-        InstructionAccount { address: mint_acct.address(), is_writable: false, is_signer: false },
-        InstructionAccount { address: owner.address(), is_writable: false, is_signer: false },
-        InstructionAccount { address: bal_ct.address(), is_writable: true, is_signer: true },
-        InstructionAccount { address: ep.address(), is_writable: false, is_signer: false },
-        InstructionAccount { address: cfg.address(), is_writable: false, is_signer: false },
-        InstructionAccount { address: dep.address(), is_writable: true, is_signer: false },
-        InstructionAccount { address: pc_token_cpi_auth.address(), is_writable: false, is_signer: false },
-        InstructionAccount { address: pc_token_program_caller.address(), is_writable: false, is_signer: false },
-        InstructionAccount { address: nk.address(), is_writable: false, is_signer: false },
-        InstructionAccount { address: payer.address(), is_writable: true, is_signer: true },
-        InstructionAccount { address: evt.address(), is_writable: false, is_signer: false },
-        InstructionAccount { address: sys.address(), is_writable: false, is_signer: false },
+        InstructionAccount {
+            address: ta_acct.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: mint_acct.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: owner.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: bal_ct.address(),
+            is_writable: true,
+            is_signer: true,
+        },
+        InstructionAccount {
+            address: ep.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: cfg.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: dep.address(),
+            is_writable: true,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: pc_token_cpi_auth.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: pc_token_program_caller.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: nk.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: payer.address(),
+            is_writable: true,
+            is_signer: true,
+        },
+        InstructionAccount {
+            address: evt.address(),
+            is_writable: false,
+            is_signer: false,
+        },
+        InstructionAccount {
+            address: sys.address(),
+            is_writable: false,
+            is_signer: false,
+        },
     ];
-    let views = [ta_acct, mint_acct, owner, bal_ct, ep, cfg, dep, pc_token_cpi_auth, pc_token_program_caller, nk, payer, evt, sys];
+    let views = [
+        ta_acct,
+        mint_acct,
+        owner,
+        bal_ct,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program_caller,
+        nk,
+        payer,
+        evt,
+        sys,
+    ];
     let data = [PC_TOKEN_IX_INIT_ACCT, ta_bump, token_cpi_bump];
-    let ix = InstructionView { program_id: pc_token_program_target.address(), data: &data, accounts: &metas };
+    let ix = InstructionView {
+        program_id: pc_token_program_target.address(),
+        data: &data,
+        accounts: &metas,
+    };
     invoke_signed(&ix, &views, &[])
 }
 
 // ── 5: CreateLpPosition ──
 fn create_lp_position(
-    program_id: &Address, accounts: &[AccountView], data: &[u8],
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
 ) -> ProgramResult {
-    let [lp_acct, pool_acct, owner, balance_ct,
-         ep, cfg, dep, cpi_authority, caller_program,
-         nk, payer, evt, sys, ..] = accounts
-    else { return Err(ProgramError::NotEnoughAccountKeys); };
-    if !payer.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
-    if data.len() < 2 { return Err(ProgramError::InvalidInstructionData); }
+    let [
+        lp_acct,
+        pool_acct,
+        owner,
+        balance_ct,
+        ep,
+        cfg,
+        dep,
+        cpi_authority,
+        caller_program,
+        nk,
+        payer,
+        evt,
+        sys,
+        ..,
+    ] = accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if !payer.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if data.len() < 2 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     let (lp_bump, cpi_bump) = (data[0], data[1]);
 
     let pd = unsafe { pool_acct.borrow_unchecked() };
     let pool = Pool::from_bytes(pd)?;
-    if pool.is_initialized != 1 { return Err(ProgramError::UninitializedAccount); }
+    if pool.is_initialized != 1 {
+        return Err(ProgramError::UninitializedAccount);
+    }
 
     let bb = [lp_bump];
     let seeds = [
@@ -374,14 +816,25 @@ fn create_lp_position(
         Seed::from(&bb),
     ];
     CreateAccount {
-        from: payer, to: lp_acct, lamports: minimum_balance(LpPosition::LEN),
-        space: LpPosition::LEN as u64, owner: program_id,
-    }.invoke_signed(&[Signer::from(&seeds)])?;
+        from: payer,
+        to: lp_acct,
+        lamports: minimum_balance(LpPosition::LEN),
+        space: LpPosition::LEN as u64,
+        owner: program_id,
+    }
+    .invoke_signed(&[Signer::from(&seeds)])?;
 
     let ctx = EncryptContext {
-        encrypt_program: ep, config: cfg, deposit: dep,
-        cpi_authority, caller_program, network_encryption_key: nk,
-        payer, event_authority: evt, system_program: sys, cpi_authority_bump: cpi_bump,
+        encrypt_program: ep,
+        config: cfg,
+        deposit: dep,
+        cpi_authority,
+        caller_program,
+        network_encryption_key: nk,
+        payer,
+        event_authority: evt,
+        system_program: sys,
+        cpi_authority_bump: cpi_bump,
     };
     ctx.create_plaintext_typed::<Uint64>(&0u64, balance_ct)?;
 
@@ -396,6 +849,13 @@ fn create_lp_position(
 
 // ── 1: Swap ──
 //
+// One-tx receipt-gated swap. The user→vault deposit goes through
+// pc-token::TransferWithReceipt (disc 22), producing a binary receipt
+// (= amount_in on success, 0 on insufficient balance) that becomes the
+// only trusted input to swap_graph. Reserves and payout are functions
+// of the receipt — a lying user produces receipt=0 and every output
+// collapses to 0, leaving reserves and the user's out-account untouched.
+//
 // Accounts:
 //   pool_acct (write),
 //   user_in_acct, user_out_acct        (user's pc-token TokenAccounts)
@@ -404,6 +864,7 @@ fn create_lp_position(
 //   vault_in_bal_ct, vault_out_bal_ct  (cts referenced by vault TAs)
 //   reserve_in_ct, reserve_out_ct      (pc-swap's mirror, from pool)
 //   amt_in_ct, min_out_ct, amt_out_ct  (user inputs + pre-allocated output)
+//   receipt_ct                         (fresh keypair, signer)
 //   ep, cfg, dep,
 //   cpi_authority (pc-swap), caller_program (pc-swap),
 //   pc_token_cpi_auth, pc_token_program,
@@ -412,58 +873,132 @@ fn create_lp_position(
 // Data: [1, swap_cpi_bump, token_cpi_bump, direction]
 //   direction: 0 = A→B, 1 = B→A
 fn swap(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
-    let [pool_acct,
-         user_in_acct, user_out_acct, vault_in_acct, vault_out_acct,
-         user_in_bal_ct, user_out_bal_ct, vault_in_bal_ct, vault_out_bal_ct,
-         reserve_in_ct, reserve_out_ct,
-         amt_in_ct, min_out_ct, amt_out_ct,
-         ep, cfg, dep, cpi_authority, caller_program,
-         pc_token_cpi_auth, pc_token_program,
-         nk, payer, evt, sys, ..] = accounts
-    else { return Err(ProgramError::NotEnoughAccountKeys); };
+    let [
+        pool_acct,
+        user_in_acct,
+        user_out_acct,
+        vault_in_acct,
+        vault_out_acct,
+        user_in_bal_ct,
+        user_out_bal_ct,
+        vault_in_bal_ct,
+        vault_out_bal_ct,
+        reserve_in_ct,
+        reserve_out_ct,
+        amt_in_ct,
+        min_out_ct,
+        amt_out_ct,
+        receipt_ct,
+        ep,
+        cfg,
+        dep,
+        cpi_authority,
+        caller_program,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        payer,
+        evt,
+        sys,
+        ..,
+    ] = accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
-    if !payer.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
-    if data.len() < 3 { return Err(ProgramError::InvalidInstructionData); }
+    if !payer.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if data.len() < 3 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     let swap_cpi_bump = data[0];
     let token_cpi_bump = data[1];
     let direction = data[2];
 
     let pd = unsafe { pool_acct.borrow_unchecked() };
     let pool = Pool::from_bytes(pd)?;
-    if pool.is_initialized != 1 { return Err(ProgramError::UninitializedAccount); }
+    if pool.is_initialized != 1 {
+        return Err(ProgramError::UninitializedAccount);
+    }
 
-    let (expected_vault_in, expected_vault_out, exp_reserve_in, exp_reserve_out) = if direction == 0 {
-        (&pool.vault_a, &pool.vault_b, &pool.reserve_a, &pool.reserve_b)
+    let (expected_vault_in, expected_vault_out, exp_reserve_in, exp_reserve_out) = if direction == 0
+    {
+        (
+            &pool.vault_a,
+            &pool.vault_b,
+            &pool.reserve_a,
+            &pool.reserve_b,
+        )
     } else {
-        (&pool.vault_b, &pool.vault_a, &pool.reserve_b, &pool.reserve_a)
+        (
+            &pool.vault_b,
+            &pool.vault_a,
+            &pool.reserve_b,
+            &pool.reserve_a,
+        )
     };
-    if vault_in_acct.address().as_ref() != expected_vault_in { return Err(ProgramError::InvalidArgument); }
-    if vault_out_acct.address().as_ref() != expected_vault_out { return Err(ProgramError::InvalidArgument); }
-    if reserve_in_ct.address().as_ref() != exp_reserve_in { return Err(ProgramError::InvalidArgument); }
-    if reserve_out_ct.address().as_ref() != exp_reserve_out { return Err(ProgramError::InvalidArgument); }
+    if vault_in_acct.address().as_ref() != expected_vault_in {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if vault_out_acct.address().as_ref() != expected_vault_out {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if reserve_in_ct.address().as_ref() != exp_reserve_in {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if reserve_out_ct.address().as_ref() != exp_reserve_out {
+        return Err(ProgramError::InvalidArgument);
+    }
 
-    // 1) Run swap math: reserves updated in lockstep with final_in / final_out
+    // 1) Hand amt_in_ct to pc-token, then CPI TransferWithReceipt (user → vault).
+    //    target_program = pc-swap (caller_program) so the receipt is authorized
+    //    back to us, readable by swap_graph and closeable below.
     let ctx = EncryptContext {
-        encrypt_program: ep, config: cfg, deposit: dep,
-        cpi_authority, caller_program, network_encryption_key: nk,
-        payer, event_authority: evt, system_program: sys, cpi_authority_bump: swap_cpi_bump,
+        encrypt_program: ep,
+        config: cfg,
+        deposit: dep,
+        cpi_authority,
+        caller_program,
+        network_encryption_key: nk,
+        payer,
+        event_authority: evt,
+        system_program: sys,
+        cpi_authority_bump: swap_cpi_bump,
     };
-    ctx.swap_graph(
-        reserve_in_ct, reserve_out_ct, amt_in_ct, min_out_ct,
-        amt_in_ct,            // out 0: final_in (overwrites amt_in_ct)
-        amt_out_ct,           // out 1: final_out
-        reserve_in_ct,        // out 2: new_reserve_in
-        reserve_out_ct,       // out 3: new_reserve_out
-    )?;
-
-    // 2) Hand off final_in to pc-token, then CPI pc-token::transfer (user → vault).
     ctx.transfer_ciphertext(amt_in_ct, pc_token_program)?;
-    let (metas, views) = pc_token_transfer_accounts(
-        user_in_acct, vault_in_acct,
-        user_in_bal_ct, vault_in_bal_ct, amt_in_ct,
-        ep, cfg, dep, pc_token_cpi_auth, pc_token_program, nk, payer, evt, sys,
+    let (metas, views) = pc_token_transfer_with_receipt_accounts(
+        user_in_acct,
+        vault_in_acct,
+        user_in_bal_ct,
+        vault_in_bal_ct,
+        amt_in_ct,
+        receipt_ct,
+        caller_program,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        payer,
+        evt,
+        sys,
     );
-    cpi_pc_token_transfer(pc_token_program, token_cpi_bump, &metas, &views, None)?;
+    cpi_pc_token_transfer_with_receipt(pc_token_program, token_cpi_bump, &metas, &views)?;
+
+    // 2) Run swap math against the receipt. final_in and final_out are 0 if
+    //    the deposit no-op'd or slippage failed; reserves move in lockstep.
+    ctx.swap_graph(
+        reserve_in_ct,
+        reserve_out_ct,
+        receipt_ct,
+        min_out_ct,
+        min_out_ct,     // out 0: final_in (overwrites min_out_ct, used only for tracing)
+        amt_out_ct,     // out 1: final_out
+        reserve_in_ct,  // out 2: new_reserve_in
+        reserve_out_ct, // out 3: new_reserve_out
+    )?;
 
     // 3) Hand off final_out to pc-token, then CPI pc-token::transfer (vault → user) signed by pool PDA.
     ctx.transfer_ciphertext(amt_out_ct, pc_token_program)?;
@@ -475,15 +1010,41 @@ fn swap(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
         Seed::from(&bb),
     ];
     let (metas, views) = pc_token_transfer_accounts(
-        vault_out_acct, user_out_acct,
-        vault_out_bal_ct, user_out_bal_ct, amt_out_ct,
-        ep, cfg, dep, pc_token_cpi_auth, pc_token_program, nk, pool_acct, evt, sys,
+        vault_out_acct,
+        user_out_acct,
+        vault_out_bal_ct,
+        user_out_bal_ct,
+        amt_out_ct,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        pool_acct,
+        evt,
+        sys,
     );
-    cpi_pc_token_transfer(pc_token_program, token_cpi_bump, &metas, &views, Some(&pool_seeds))?;
+    cpi_pc_token_transfer(
+        pc_token_program,
+        token_cpi_bump,
+        &metas,
+        &views,
+        Some(&pool_seeds),
+    )?;
+
+    // 4) Reclaim receipt rent. close_ciphertext signs as pc-swap's CPI auth and
+    //    requires receipt.authorized == pc-swap, which holds (set by step 1).
+    ctx.close_ciphertext(receipt_ct, payer)?;
     Ok(())
 }
 
 // ── 2: AddLiquidity ──
+//
+// Receipt-gated: each user→vault deposit goes through TransferWithReceipt;
+// add_liquidity_graph reads both receipts as the trusted deposit amounts.
+// If either deposit no-ops (insufficient balance), the corresponding
+// receipt is 0 and reserves / LP supply stay consistent.
 //
 // Accounts:
 //   pool_acct (write), lp_pos_acct (read),
@@ -492,6 +1053,7 @@ fn swap(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
 //   user_a_bal_ct, user_b_bal_ct, vault_a_bal_ct, vault_b_bal_ct,
 //   reserve_a_ct, reserve_b_ct, total_supply_ct,
 //   amt_a_ct, amt_b_ct, user_lp_ct,
+//   receipt_a_ct, receipt_b_ct          (fresh keypairs, signers)
 //   ep, cfg, dep,
 //   cpi_authority (pc-swap), caller_program (pc-swap),
 //   pc_token_cpi_auth, pc_token_program,
@@ -499,64 +1061,161 @@ fn swap(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
 //
 // Data: [2, swap_cpi_bump, token_cpi_bump]
 fn add_liquidity(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
-    let [pool_acct, lp_pos_acct,
-         user_a_acct, user_b_acct, vault_a_acct, vault_b_acct,
-         user_a_bal_ct, user_b_bal_ct, vault_a_bal_ct, vault_b_bal_ct,
-         ra_ct, rb_ct, ts_ct,
-         amt_a_ct, amt_b_ct, user_lp_ct,
-         ep, cfg, dep, cpi_authority, caller_program,
-         pc_token_cpi_auth, pc_token_program,
-         nk, payer, evt, sys, ..] = accounts
-    else { return Err(ProgramError::NotEnoughAccountKeys); };
+    let [
+        pool_acct,
+        lp_pos_acct,
+        user_a_acct,
+        user_b_acct,
+        vault_a_acct,
+        vault_b_acct,
+        user_a_bal_ct,
+        user_b_bal_ct,
+        vault_a_bal_ct,
+        vault_b_bal_ct,
+        ra_ct,
+        rb_ct,
+        ts_ct,
+        amt_a_ct,
+        amt_b_ct,
+        user_lp_ct,
+        receipt_a_ct,
+        receipt_b_ct,
+        ep,
+        cfg,
+        dep,
+        cpi_authority,
+        caller_program,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        payer,
+        evt,
+        sys,
+        ..,
+    ] = accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
-    if !payer.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
-    if data.len() < 2 { return Err(ProgramError::InvalidInstructionData); }
+    if !payer.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if data.len() < 2 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     let swap_cpi_bump = data[0];
     let token_cpi_bump = data[1];
 
     let pd = unsafe { pool_acct.borrow_unchecked() };
     let pool = Pool::from_bytes(pd)?;
-    if pool.is_initialized != 1 { return Err(ProgramError::UninitializedAccount); }
-    if vault_a_acct.address().as_ref() != &pool.vault_a { return Err(ProgramError::InvalidArgument); }
-    if vault_b_acct.address().as_ref() != &pool.vault_b { return Err(ProgramError::InvalidArgument); }
-    if ra_ct.address().as_ref() != &pool.reserve_a { return Err(ProgramError::InvalidArgument); }
-    if rb_ct.address().as_ref() != &pool.reserve_b { return Err(ProgramError::InvalidArgument); }
-    if ts_ct.address().as_ref() != &pool.total_supply { return Err(ProgramError::InvalidArgument); }
+    if pool.is_initialized != 1 {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if vault_a_acct.address().as_ref() != &pool.vault_a {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if vault_b_acct.address().as_ref() != &pool.vault_b {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if ra_ct.address().as_ref() != &pool.reserve_a {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if rb_ct.address().as_ref() != &pool.reserve_b {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if ts_ct.address().as_ref() != &pool.total_supply {
+        return Err(ProgramError::InvalidArgument);
+    }
 
     let lpd = unsafe { lp_pos_acct.borrow_unchecked() };
     let lp_pos = LpPosition::from_bytes(lpd)?;
-    if &lp_pos.pool != pool_acct.address().as_array() { return Err(ProgramError::InvalidArgument); }
-    if &lp_pos.owner != payer.address().as_array() { return Err(ProgramError::InvalidArgument); }
-    if user_lp_ct.address().as_ref() != &lp_pos.balance { return Err(ProgramError::InvalidArgument); }
+    if &lp_pos.pool != pool_acct.address().as_array() {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if &lp_pos.owner != payer.address().as_array() {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if user_lp_ct.address().as_ref() != &lp_pos.balance {
+        return Err(ProgramError::InvalidArgument);
+    }
 
-    // 1) Run liquidity math: updates reserves, supply, and user_lp.
     let ctx = EncryptContext {
-        encrypt_program: ep, config: cfg, deposit: dep,
-        cpi_authority, caller_program, network_encryption_key: nk,
-        payer, event_authority: evt, system_program: sys, cpi_authority_bump: swap_cpi_bump,
+        encrypt_program: ep,
+        config: cfg,
+        deposit: dep,
+        cpi_authority,
+        caller_program,
+        network_encryption_key: nk,
+        payer,
+        event_authority: evt,
+        system_program: sys,
+        cpi_authority_bump: swap_cpi_bump,
     };
+
+    // 1) Transfer A with receipt: user → vault_a, receipt authorized to pc-swap.
+    ctx.transfer_ciphertext(amt_a_ct, pc_token_program)?;
+    let (metas, views) = pc_token_transfer_with_receipt_accounts(
+        user_a_acct,
+        vault_a_acct,
+        user_a_bal_ct,
+        vault_a_bal_ct,
+        amt_a_ct,
+        receipt_a_ct,
+        caller_program,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        payer,
+        evt,
+        sys,
+    );
+    cpi_pc_token_transfer_with_receipt(pc_token_program, token_cpi_bump, &metas, &views)?;
+
+    // 2) Transfer B with receipt: user → vault_b.
+    ctx.transfer_ciphertext(amt_b_ct, pc_token_program)?;
+    let (metas, views) = pc_token_transfer_with_receipt_accounts(
+        user_b_acct,
+        vault_b_acct,
+        user_b_bal_ct,
+        vault_b_bal_ct,
+        amt_b_ct,
+        receipt_b_ct,
+        caller_program,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        payer,
+        evt,
+        sys,
+    );
+    cpi_pc_token_transfer_with_receipt(pc_token_program, token_cpi_bump, &metas, &views)?;
+
+    // 3) Run liquidity math against the receipts. Reserves, supply, and LP all
+    //    update from receipts only — lying inputs collapse to 0 uniformly.
     ctx.add_liquidity_graph(
-        ra_ct, rb_ct, ts_ct, amt_a_ct, amt_b_ct, user_lp_ct,
-        ra_ct, rb_ct, ts_ct, user_lp_ct,
+        ra_ct,
+        rb_ct,
+        ts_ct,
+        receipt_a_ct,
+        receipt_b_ct,
+        user_lp_ct,
+        amt_a_ct,   // out 0: final_a (overwrites amt_a_ct, for tracing)
+        amt_b_ct,   // out 1: final_b
+        ra_ct,      // out 2: new_reserve_a
+        rb_ct,      // out 3: new_reserve_b
+        ts_ct,      // out 4: new_total_supply
+        user_lp_ct, // out 5: new_user_lp
     )?;
 
-    // 2) Transfer A: user → vault_a
-    ctx.transfer_ciphertext(amt_a_ct, pc_token_program)?;
-    let (metas, views) = pc_token_transfer_accounts(
-        user_a_acct, vault_a_acct,
-        user_a_bal_ct, vault_a_bal_ct, amt_a_ct,
-        ep, cfg, dep, pc_token_cpi_auth, pc_token_program, nk, payer, evt, sys,
-    );
-    cpi_pc_token_transfer(pc_token_program, token_cpi_bump, &metas, &views, None)?;
-
-    // 3) Transfer B: user → vault_b
-    ctx.transfer_ciphertext(amt_b_ct, pc_token_program)?;
-    let (metas, views) = pc_token_transfer_accounts(
-        user_b_acct, vault_b_acct,
-        user_b_bal_ct, vault_b_bal_ct, amt_b_ct,
-        ep, cfg, dep, pc_token_cpi_auth, pc_token_program, nk, payer, evt, sys,
-    );
-    cpi_pc_token_transfer(pc_token_program, token_cpi_bump, &metas, &views, None)?;
+    // 4) Reclaim receipt rent.
+    ctx.close_ciphertext(receipt_a_ct, payer)?;
+    ctx.close_ciphertext(receipt_b_ct, payer)?;
     Ok(())
 }
 
@@ -565,45 +1224,99 @@ fn add_liquidity(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
 // Accounts: similar to AddLiquidity but vault → user, plus out_a_ct, out_b_ct.
 // Data: [4, swap_cpi_bump, token_cpi_bump]
 fn remove_liquidity(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
-    let [pool_acct, lp_pos_acct,
-         user_a_acct, user_b_acct, vault_a_acct, vault_b_acct,
-         user_a_bal_ct, user_b_bal_ct, vault_a_bal_ct, vault_b_bal_ct,
-         ra_ct, rb_ct, ts_ct,
-         burn_ct, user_lp_ct, out_a_ct, out_b_ct,
-         ep, cfg, dep, cpi_authority, caller_program,
-         pc_token_cpi_auth, pc_token_program,
-         nk, payer, evt, sys, ..] = accounts
-    else { return Err(ProgramError::NotEnoughAccountKeys); };
+    let [
+        pool_acct,
+        lp_pos_acct,
+        user_a_acct,
+        user_b_acct,
+        vault_a_acct,
+        vault_b_acct,
+        user_a_bal_ct,
+        user_b_bal_ct,
+        vault_a_bal_ct,
+        vault_b_bal_ct,
+        ra_ct,
+        rb_ct,
+        ts_ct,
+        burn_ct,
+        user_lp_ct,
+        out_a_ct,
+        out_b_ct,
+        ep,
+        cfg,
+        dep,
+        cpi_authority,
+        caller_program,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        payer,
+        evt,
+        sys,
+        ..,
+    ] = accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
-    if !payer.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
-    if data.len() < 2 { return Err(ProgramError::InvalidInstructionData); }
+    if !payer.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if data.len() < 2 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     let swap_cpi_bump = data[0];
     let token_cpi_bump = data[1];
 
     let pd = unsafe { pool_acct.borrow_unchecked() };
     let pool = Pool::from_bytes(pd)?;
-    if pool.is_initialized != 1 { return Err(ProgramError::UninitializedAccount); }
-    if vault_a_acct.address().as_ref() != &pool.vault_a { return Err(ProgramError::InvalidArgument); }
-    if vault_b_acct.address().as_ref() != &pool.vault_b { return Err(ProgramError::InvalidArgument); }
-    if ra_ct.address().as_ref() != &pool.reserve_a { return Err(ProgramError::InvalidArgument); }
-    if rb_ct.address().as_ref() != &pool.reserve_b { return Err(ProgramError::InvalidArgument); }
-    if ts_ct.address().as_ref() != &pool.total_supply { return Err(ProgramError::InvalidArgument); }
+    if pool.is_initialized != 1 {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if vault_a_acct.address().as_ref() != &pool.vault_a {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if vault_b_acct.address().as_ref() != &pool.vault_b {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if ra_ct.address().as_ref() != &pool.reserve_a {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if rb_ct.address().as_ref() != &pool.reserve_b {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if ts_ct.address().as_ref() != &pool.total_supply {
+        return Err(ProgramError::InvalidArgument);
+    }
 
     let lpd = unsafe { lp_pos_acct.borrow_unchecked() };
     let lp_pos = LpPosition::from_bytes(lpd)?;
-    if &lp_pos.pool != pool_acct.address().as_array() { return Err(ProgramError::InvalidArgument); }
-    if &lp_pos.owner != payer.address().as_array() { return Err(ProgramError::InvalidArgument); }
-    if user_lp_ct.address().as_ref() != &lp_pos.balance { return Err(ProgramError::InvalidArgument); }
+    if &lp_pos.pool != pool_acct.address().as_array() {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if &lp_pos.owner != payer.address().as_array() {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if user_lp_ct.address().as_ref() != &lp_pos.balance {
+        return Err(ProgramError::InvalidArgument);
+    }
 
     // 1) Run remove math: out_a/out_b are 0 if user_lp < burn → transfers no-op.
     let ctx = EncryptContext {
-        encrypt_program: ep, config: cfg, deposit: dep,
-        cpi_authority, caller_program, network_encryption_key: nk,
-        payer, event_authority: evt, system_program: sys, cpi_authority_bump: swap_cpi_bump,
+        encrypt_program: ep,
+        config: cfg,
+        deposit: dep,
+        cpi_authority,
+        caller_program,
+        network_encryption_key: nk,
+        payer,
+        event_authority: evt,
+        system_program: sys,
+        cpi_authority_bump: swap_cpi_bump,
     };
     ctx.remove_liquidity_graph(
-        ra_ct, rb_ct, ts_ct, burn_ct, user_lp_ct,
-        out_a_ct, out_b_ct, ra_ct, rb_ct, ts_ct, user_lp_ct,
+        ra_ct, rb_ct, ts_ct, burn_ct, user_lp_ct, out_a_ct, out_b_ct, ra_ct, rb_ct, ts_ct,
+        user_lp_ct,
     )?;
 
     // 2) vault_a → user_a, signed by pool PDA
@@ -617,20 +1330,54 @@ fn remove_liquidity(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
 
     ctx.transfer_ciphertext(out_a_ct, pc_token_program)?;
     let (metas, views) = pc_token_transfer_accounts(
-        vault_a_acct, user_a_acct,
-        vault_a_bal_ct, user_a_bal_ct, out_a_ct,
-        ep, cfg, dep, pc_token_cpi_auth, pc_token_program, nk, pool_acct, evt, sys,
+        vault_a_acct,
+        user_a_acct,
+        vault_a_bal_ct,
+        user_a_bal_ct,
+        out_a_ct,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        pool_acct,
+        evt,
+        sys,
     );
-    cpi_pc_token_transfer(pc_token_program, token_cpi_bump, &metas, &views, Some(&pool_seeds))?;
+    cpi_pc_token_transfer(
+        pc_token_program,
+        token_cpi_bump,
+        &metas,
+        &views,
+        Some(&pool_seeds),
+    )?;
 
     // 3) vault_b → user_b
     ctx.transfer_ciphertext(out_b_ct, pc_token_program)?;
     let (metas, views) = pc_token_transfer_accounts(
-        vault_b_acct, user_b_acct,
-        vault_b_bal_ct, user_b_bal_ct, out_b_ct,
-        ep, cfg, dep, pc_token_cpi_auth, pc_token_program, nk, pool_acct, evt, sys,
+        vault_b_acct,
+        user_b_acct,
+        vault_b_bal_ct,
+        user_b_bal_ct,
+        out_b_ct,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        pool_acct,
+        evt,
+        sys,
     );
-    cpi_pc_token_transfer(pc_token_program, token_cpi_bump, &metas, &views, Some(&pool_seeds))?;
+    cpi_pc_token_transfer(
+        pc_token_program,
+        token_cpi_bump,
+        &metas,
+        &views,
+        Some(&pool_seeds),
+    )?;
     Ok(())
 }
 
@@ -638,10 +1385,10 @@ fn remove_liquidity(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
 
 #[cfg(test)]
 mod tests {
-    use encrypt_types::graph::{get_node, parse_graph, GraphNodeKind};
+    use super::{add_liquidity_graph, remove_liquidity_graph, swap_graph};
+    use encrypt_types::graph::{GraphNodeKind, get_node, parse_graph};
     use encrypt_types::identifier::*;
     use encrypt_types::types::FheType;
-    use super::{add_liquidity_graph, remove_liquidity_graph, swap_graph};
 
     fn run_mock(graph_fn: fn() -> Vec<u8>, inputs: &[u128], fhe_types: &[FheType]) -> Vec<u128> {
         let data = graph_fn();
@@ -654,7 +1401,9 @@ mod tests {
             let ft = FheType::from_u8(n.fhe_type()).unwrap_or(FheType::EUint64);
             let d = match n.kind() {
                 k if k == GraphNodeKind::Input as u8 => {
-                    let v = inputs[inp]; let t = fhe_types[inp]; inp += 1;
+                    let v = inputs[inp];
+                    let t = fhe_types[inp];
+                    inp += 1;
                     encode_mock_digest(t, v)
                 }
                 k if k == GraphNodeKind::Constant as u8 => {
@@ -665,12 +1414,26 @@ mod tests {
                     encode_mock_digest(ft, u128::from_le_bytes(buf))
                 }
                 k if k == GraphNodeKind::Op as u8 => {
-                    let (a, b, c) = (n.input_a() as usize, n.input_b() as usize, n.input_c() as usize);
-                    if n.op_type() == 60 { mock_select(&digests[a], &digests[b], &digests[c]) }
-                    else if b == 0xFFFF {
-                        mock_unary_compute(unsafe { core::mem::transmute(n.op_type()) }, &digests[a], ft)
+                    let (a, b, c) = (
+                        n.input_a() as usize,
+                        n.input_b() as usize,
+                        n.input_c() as usize,
+                    );
+                    if n.op_type() == 60 {
+                        mock_select(&digests[a], &digests[b], &digests[c])
+                    } else if b == 0xFFFF {
+                        mock_unary_compute(
+                            unsafe { core::mem::transmute(n.op_type()) },
+                            &digests[a],
+                            ft,
+                        )
                     } else {
-                        mock_binary_compute(unsafe { core::mem::transmute(n.op_type()) }, &digests[a], &digests[b], ft)
+                        mock_binary_compute(
+                            unsafe { core::mem::transmute(n.op_type()) },
+                            &digests[a],
+                            &digests[b],
+                            ft,
+                        )
                     }
                 }
                 k if k == GraphNodeKind::Output as u8 => digests[n.input_a() as usize],
@@ -678,59 +1441,134 @@ mod tests {
             };
             digests.push(d);
         }
-        (0..num).filter(|&i| get_node(pg.node_bytes(), i as u16).unwrap().kind() == GraphNodeKind::Output as u8)
-            .map(|i| decode_mock_identifier(&digests[i])).collect()
+        (0..num)
+            .filter(|&i| {
+                get_node(pg.node_bytes(), i as u16).unwrap().kind() == GraphNodeKind::Output as u8
+            })
+            .map(|i| decode_mock_identifier(&digests[i]))
+            .collect()
     }
 
     const T: FheType = FheType::EUint64;
 
-    #[test] fn swap_basic() {
-        // reserve_in, reserve_out, amount_in, min_out
+    #[test]
+    fn swap_basic() {
+        // reserve_in, reserve_out, receipt, min_out
         let r = run_mock(swap_graph, &[1000, 2000, 100, 0], &[T, T, T, T]);
         // r = (final_in, final_out, new_reserve_in, new_reserve_out)
-        assert_eq!(r[0], 100, "final_in == amount_in on success");
+        assert_eq!(r[0], 100, "final_in == receipt on success");
         assert!(r[1] > 0, "final_out > 0");
         assert_eq!(r[2], 1100);
         assert!(r[2] * r[3] >= 1000 * 2000);
     }
-    #[test] fn swap_slippage() {
+    #[test]
+    fn swap_slippage() {
         let r = run_mock(swap_graph, &[1000, 2000, 100, 999], &[T, T, T, T]);
-        assert_eq!(r[0], 0); assert_eq!(r[1], 0);
-        assert_eq!(r[2], 1000); assert_eq!(r[3], 2000);
+        assert_eq!(r[0], 0);
+        assert_eq!(r[1], 0);
+        assert_eq!(r[2], 1000);
+        assert_eq!(r[3], 2000);
+    }
+    #[test]
+    fn swap_lying_user_receipt_zero() {
+        // user claims amount_in=100 but transfer no-op'd → receipt=0.
+        // Reserves must stay 1000/2000, payout must be 0.
+        let r = run_mock(swap_graph, &[1000, 2000, 0, 0], &[T, T, T, T]);
+        assert_eq!(r[0], 0, "final_in collapses with receipt=0");
+        assert_eq!(r[1], 0, "final_out collapses with receipt=0");
+        assert_eq!(r[2], 1000, "reserve_in untouched");
+        assert_eq!(r[3], 2000, "reserve_out untouched");
     }
 
-    #[test] fn add_liq_first() {
-        let r = run_mock(add_liquidity_graph, &[0, 0, 0, 1000, 2000, 0], &[T, T, T, T, T, T]);
-        assert_eq!(r[0], 1000); assert_eq!(r[1], 2000);
-        assert_eq!(r[2], 1000, "supply = amount_a on first deposit");
-        assert_eq!(r[3], 1000);
+    #[test]
+    fn add_liq_first() {
+        // reserve_a, reserve_b, total_supply, receipt_a, receipt_b, user_lp
+        let r = run_mock(
+            add_liquidity_graph,
+            &[0, 0, 0, 1000, 2000, 0],
+            &[T, T, T, T, T, T],
+        );
+        // r = (final_a, final_b, new_reserve_a, new_reserve_b, new_total_supply, new_user_lp)
+        assert_eq!(r[0], 1000);
+        assert_eq!(r[1], 2000);
+        assert_eq!(r[2], 1000);
+        assert_eq!(r[3], 2000);
+        assert_eq!(r[4], 1000, "supply = receipt_a on first deposit");
+        assert_eq!(r[5], 1000);
     }
-    #[test] fn add_liq_second() {
+    #[test]
+    fn add_liq_second() {
         let supply = 1000u128;
-        let r = run_mock(add_liquidity_graph, &[1000, 2000, supply, 500, 1000, 0], &[T, T, T, T, T, T]);
-        assert_eq!(r[0], 1500); assert_eq!(r[1], 3000);
-        assert!(r[2] > supply); assert!(r[3] > 0);
+        let r = run_mock(
+            add_liquidity_graph,
+            &[1000, 2000, supply, 500, 1000, 0],
+            &[T, T, T, T, T, T],
+        );
+        assert_eq!(r[0], 500);
+        assert_eq!(r[1], 1000);
+        assert_eq!(r[2], 1500);
+        assert_eq!(r[3], 3000);
+        assert!(r[4] > supply);
+        assert!(r[5] > 0);
+    }
+    #[test]
+    fn add_liq_lying_a_receipt_zero() {
+        // user lied about token A: receipt_a=0, receipt_b=1000.
+        // Reserves should advance only for B, LP should be 0 (lp_from_a=0 dominates min).
+        let supply = 1000u128;
+        let r = run_mock(
+            add_liquidity_graph,
+            &[1000, 2000, supply, 0, 1000, 0],
+            &[T, T, T, T, T, T],
+        );
+        assert_eq!(r[0], 0);
+        assert_eq!(r[1], 1000);
+        assert_eq!(r[2], 1000);
+        assert_eq!(r[3], 3000);
+        assert_eq!(r[4], supply, "supply unchanged when lp_to_mint=0");
+        assert_eq!(r[5], 0);
     }
 
-    #[test] fn remove_liq_sufficient() {
+    #[test]
+    fn remove_liq_sufficient() {
         // reserves 10000/20000, supply 100, burn 50, user_lp 50
-        let r = run_mock(remove_liquidity_graph, &[10000, 20000, 100, 50, 50], &[T, T, T, T, T]);
-        assert!(r[0] > 0); assert!(r[1] > 0);
+        let r = run_mock(
+            remove_liquidity_graph,
+            &[10000, 20000, 100, 50, 50],
+            &[T, T, T, T, T],
+        );
+        assert!(r[0] > 0);
+        assert!(r[1] > 0);
         assert_eq!(r[5], 0, "user lp drained");
     }
-    #[test] fn remove_liq_insufficient() {
-        let r = run_mock(remove_liquidity_graph, &[10000, 20000, 100, 50, 30], &[T, T, T, T, T]);
-        assert_eq!(r[0], 0); assert_eq!(r[1], 0);
-        assert_eq!(r[2], 10000); assert_eq!(r[3], 20000);
-        assert_eq!(r[4], 100); assert_eq!(r[5], 30);
+    #[test]
+    fn remove_liq_insufficient() {
+        let r = run_mock(
+            remove_liquidity_graph,
+            &[10000, 20000, 100, 50, 30],
+            &[T, T, T, T, T],
+        );
+        assert_eq!(r[0], 0);
+        assert_eq!(r[1], 0);
+        assert_eq!(r[2], 10000);
+        assert_eq!(r[3], 20000);
+        assert_eq!(r[4], 100);
+        assert_eq!(r[5], 30);
     }
 
-    #[test] fn graph_shapes() {
-        let g = swap_graph(); let pg = parse_graph(&g).unwrap();
-        assert_eq!(pg.header().num_inputs(), 4); assert_eq!(pg.header().num_outputs(), 4);
-        let g = add_liquidity_graph(); let pg = parse_graph(&g).unwrap();
-        assert_eq!(pg.header().num_inputs(), 6); assert_eq!(pg.header().num_outputs(), 4);
-        let g = remove_liquidity_graph(); let pg = parse_graph(&g).unwrap();
-        assert_eq!(pg.header().num_inputs(), 5); assert_eq!(pg.header().num_outputs(), 6);
+    #[test]
+    fn graph_shapes() {
+        let g = swap_graph();
+        let pg = parse_graph(&g).unwrap();
+        assert_eq!(pg.header().num_inputs(), 4);
+        assert_eq!(pg.header().num_outputs(), 4);
+        let g = add_liquidity_graph();
+        let pg = parse_graph(&g).unwrap();
+        assert_eq!(pg.header().num_inputs(), 6);
+        assert_eq!(pg.header().num_outputs(), 6);
+        let g = remove_liquidity_graph();
+        let pg = parse_graph(&g).unwrap();
+        assert_eq!(pg.header().num_inputs(), 5);
+        assert_eq!(pg.header().num_outputs(), 6);
     }
 }

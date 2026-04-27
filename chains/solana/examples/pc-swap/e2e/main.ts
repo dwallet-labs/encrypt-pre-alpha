@@ -3,10 +3,11 @@
  * PC-Swap E2E — Confidential AMM that composes with PC-Token via CPI.
  *
  * Pool reserves are real PC-Token TokenAccounts owned by the pool PDA.
- * Each swap / add / remove does:
- *   1. an FHE graph (computes amounts conditionally on validity)
- *   2. transfer_ciphertext(amount → pc-token program)
- *   3. CPI pc-token::transfer
+ * User → vault deposits go through pc-token::TransferWithReceipt (disc 22)
+ * which emits a binary receipt ciphertext (= amount on success, 0 on
+ * insufficient balance). Reserves and payouts are functions of the
+ * receipt — a lying user produces receipt=0 and the swap collapses to
+ * a no-op uniformly.
  *
  * Balances stay encrypted throughout; only transaction success is observable.
  *
@@ -27,7 +28,8 @@ import {
 } from "../../pc-token/e2e/instructions.ts";
 import { createSplMint, createSplTokenAccount, splMintToIx, readSplBalance } from "../../pc-token/e2e/spl-helpers.ts";
 
-const RPC = "https://api.devnet.solana.com";
+const RPC = process.env.RPC_URL ?? "https://api.devnet.solana.com";
+const GRPC_URL = process.env.GRPC_URL;
 const FHE64 = 4;
 const DECIMALS = 6;
 const TOKENS = (n: number) => BigInt(n) * 1_000_000n;
@@ -55,7 +57,7 @@ async function enc(grpc: any, v: bigint, nk: Buffer, target: PublicKey): Promise
 
 async function main() {
   console.log("\n\x1b[1m═══ PC-Swap E2E: AMM composing with PC-Token via CPI ═══\x1b[0m\n");
-  const grpc = createEncryptClient();
+  const grpc = GRPC_URL ? createEncryptClient(GRPC_URL) : createEncryptClient();
   ok(`Payer: ${payer.publicKey.toBase58()}, Balance: ${(await conn.getBalance(payer.publicKey))/1e9} SOL`);
 
   // ── Encrypt setup ──
@@ -156,51 +158,74 @@ async function main() {
   ok(`LP: ${lpPda.toBase58().slice(0, 12)}…`);
 
   // ═══ 5. AddLiquidity (500 pcUSD + 500 pcDOGE) ═══
-  log("5/8", "AddLiquidity — pc-swap CPIs pc-token::transfer twice (user → vaults)...");
+  log("5/9", "AddLiquidity — 2× CPI pc-token::TransferWithReceipt; reserves gated on receipts...");
   const addUsdCt = await enc(grpc, TOKENS(500), nk, SP);
   const addDogeCt = await enc(grpc, TOKENS(500), nk, SP);
+  const addReceiptA = Keypair.generate(), addReceiptB = Keypair.generate();
   await sendTx(conn, payer, [addLiquidityIx(swapCtx, poolPda,
     userUsdPc, userDogePc, poolVaultUsd, poolVaultDoge,
     userUsdBal.publicKey, userDogeBal.publicKey, poolVaultUsdBal.publicKey, poolVaultDogeBal.publicKey,
     poolReserveUsd.publicKey, poolReserveDoge.publicKey, poolTotalSupply.publicKey,
     addUsdCt, addDogeCt, userLpBal.publicKey,
-  )]);
+    addReceiptA.publicKey, addReceiptB.publicKey,
+  )], [addReceiptA, addReceiptB]);
   await pollUntil(conn, poolReserveUsd.publicKey, isVerified);
   await pollUntil(conn, poolReserveDoge.publicKey, isVerified);
   await pollUntil(conn, userLpBal.publicKey, isVerified);
-  ok("Liquidity added — vault balances incremented via CPI, LP minted");
+  ok("Liquidity added — vault balances incremented via CPI, LP minted, receipts closed");
 
   // ═══ 6. Swap (50 pcUSD → pcDOGE) ═══
-  log("6/8", "Swap 50 pcUSD → pcDOGE (CPI: pc-swap → pc-token::transfer × 2)...");
+  log("6/9", "Swap 50 pcUSD → pcDOGE — TransferWithReceipt feeds swap_graph...");
   const swapInCt = await enc(grpc, TOKENS(50), nk, SP);
   const swapMinCt = await enc(grpc, 0n, nk, SP);
   const swapOutCt = await enc(grpc, 0n, nk, SP);
+  const swapReceipt = Keypair.generate();
   await sendTx(conn, payer, [swapIx(swapCtx, poolPda,
     userUsdPc, userDogePc, poolVaultUsd, poolVaultDoge,
     userUsdBal.publicKey, userDogeBal.publicKey, poolVaultUsdBal.publicKey, poolVaultDogeBal.publicKey,
     poolReserveUsd.publicKey, poolReserveDoge.publicKey,
-    swapInCt, swapMinCt, swapOutCt, 0,
-  )]);
+    swapInCt, swapMinCt, swapOutCt, swapReceipt.publicKey, 0,
+  )], [swapReceipt]);
   await pollUntil(conn, poolReserveUsd.publicKey, isVerified);
   await pollUntil(conn, poolReserveDoge.publicKey, isVerified);
   ok("Swap executed — user paid pcUSD to vault, received pcDOGE from vault");
 
   // ═══ 7. Swap with slippage rejection ═══
-  log("7/8", "Swap with high min_out — should no-op (slippage check in FHE)...");
+  log("7/9", "Swap with high min_out — should no-op (slippage check in FHE)...");
   const swapIn2 = await enc(grpc, TOKENS(10), nk, SP);
   const swapMin2 = await enc(grpc, TOKENS(999), nk, SP); // unattainable
   const swapOut2 = await enc(grpc, 0n, nk, SP);
+  const swapReceipt2 = Keypair.generate();
   await sendTx(conn, payer, [swapIx(swapCtx, poolPda,
     userUsdPc, userDogePc, poolVaultUsd, poolVaultDoge,
     userUsdBal.publicKey, userDogeBal.publicKey, poolVaultUsdBal.publicKey, poolVaultDogeBal.publicKey,
     poolReserveUsd.publicKey, poolReserveDoge.publicKey,
-    swapIn2, swapMin2, swapOut2, 0,
-  )]);
+    swapIn2, swapMin2, swapOut2, swapReceipt2.publicKey, 0,
+  )], [swapReceipt2]);
   ok("Slippage no-op submitted (FHE conditional zeroes both transfer amounts)");
 
-  // ═══ 8. RemoveLiquidity ═══
-  log("8/8", "RemoveLiquidity — pc-swap CPIs pc-token::transfer twice (vaults → user) signed by pool PDA...");
-  // Burn ~250 LP units (we minted 500 on first deposit since lp = amount_a)
+  // ═══ 8. Lying user — soundness test ═══
+  // User claims amount_in = 99,999 pcUSD but their balance is far below that
+  // (after wrap/add/swap above they have ~450 pcUSD left). pc-token's
+  // TransferWithReceipt no-ops the deposit and emits receipt=0; swap_graph
+  // collapses every output to 0; reserves and the user's pcDOGE balance
+  // stay untouched.
+  log("8/9", "Lying user — amount_in greater than balance. Receipt should be 0; reserves unchanged...");
+  const lieInCt = await enc(grpc, TOKENS(99_999), nk, SP);
+  const lieMinCt = await enc(grpc, 0n, nk, SP);
+  const lieOutCt = await enc(grpc, 0n, nk, SP);
+  const lieReceipt = Keypair.generate();
+  await sendTx(conn, payer, [swapIx(swapCtx, poolPda,
+    userUsdPc, userDogePc, poolVaultUsd, poolVaultDoge,
+    userUsdBal.publicKey, userDogeBal.publicKey, poolVaultUsdBal.publicKey, poolVaultDogeBal.publicKey,
+    poolReserveUsd.publicKey, poolReserveDoge.publicKey,
+    lieInCt, lieMinCt, lieOutCt, lieReceipt.publicKey, 0,
+  )], [lieReceipt]);
+  ok("Lying-user tx submitted — soundness invariant: receipt=0 ⇒ pool state unchanged");
+
+  // ═══ 9. RemoveLiquidity ═══
+  log("9/9", "RemoveLiquidity — pc-swap CPIs pc-token::transfer twice (vaults → user) signed by pool PDA...");
+  // Burn ~250 LP units (we minted 500 on first deposit since lp = receipt_a)
   const burnCt = await enc(grpc, TOKENS(250), nk, SP);
   const outA = await enc(grpc, 0n, nk, SP);
   const outB = await enc(grpc, 0n, nk, SP);
@@ -216,17 +241,16 @@ async function main() {
   ok("Liquidity removed — vault balances decremented, user receives pc-tokens, LP burned");
 
   console.log("\n\x1b[1m═══ Result ═══\x1b[0m\n");
-  console.log("  pc-swap composes with pc-token via Cross-Program Invocation:");
+  console.log("  pc-swap composes with pc-token via CPI; receipts gate state updates:");
   console.log("    • Pool vaults are real pc-token TokenAccounts (owned by pool PDA)");
   console.log("    • create_pool        → CPI pc-token::initialize_account × 2");
-  console.log("    • add_liquidity      → CPI pc-token::transfer × 2 (user → vaults)");
-  console.log("    • swap               → CPI pc-token::transfer × 2 (one each direction)");
-  console.log("    • remove_liquidity   → CPI pc-token::transfer × 2 (vaults → user, signed by pool PDA)");
+  console.log("    • add_liquidity      → CPI pc-token::TransferWithReceipt × 2 + add_liq_graph");
+  console.log("    • swap               → CPI pc-token::TransferWithReceipt + swap_graph + transfer (vault→user)");
+  console.log("    • remove_liquidity   → remove_liq_graph + CPI pc-token::transfer × 2 (vaults → user)");
   console.log("");
-  console.log("  Each amount ciphertext is moved to pc-token's program with");
-  console.log("  transfer_ciphertext (move semantics — the original loses access)");
-  console.log("  before the CPI, so the encrypt program accepts pc-token as the");
-  console.log("  authorized party for the underlying transfer_graph.");
+  console.log("  Soundness: every reserve and payout update is a function of the");
+  console.log("  binary receipt ciphertext (= amount on success, 0 on insufficient");
+  console.log("  balance). Lying about amount_in produces receipt=0 → uniform no-op.");
   console.log("");
   console.log("  All balances stayed encrypted throughout. \x1b[32m✓\x1b[0m\n");
 

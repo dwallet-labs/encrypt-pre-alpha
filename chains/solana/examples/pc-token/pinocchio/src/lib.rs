@@ -161,6 +161,19 @@ fn assert_not_frozen(ta: &TokenAccount) -> ProgramResult { if ta.is_frozen() { E
     (new_balance, burned)
 }
 
+/// Transfer + binary receipt. Same balance updates as `transfer_graph`, plus
+/// a third output `actual` ∈ {amount, 0} — the receipt is the actually-
+/// transferred value, never partial. Consumers (e.g., pc-swap) multiply
+/// downstream state by the receipt to gate their own updates in lockstep.
+#[encrypt_fn] fn transfer_receipt_graph(from_balance: EUint64, to_balance: EUint64, amount: EUint64) -> (EUint64, EUint64, EUint64) {
+    let s = from_balance >= amount;
+    let zero = amount - amount;
+    let actual = if s { amount } else { zero };
+    let nf = from_balance - actual;
+    let nt = to_balance + actual;
+    (nf, nt, actual)
+}
+
 // ── Dispatch ──
 
 fn process_instruction(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
@@ -175,6 +188,7 @@ fn process_instruction(program_id: &Address, accounts: &[AccountView], data: &[u
         Some((&10, rest)) => freeze_account(accounts, rest),
         Some((&11, rest)) => thaw_account(accounts, rest),
         Some((&20, rest)) => transfer_from(accounts, rest),
+        Some((&22, rest)) => transfer_with_receipt(accounts, rest),
         Some((&23, rest)) => initialize_vault(program_id, accounts, rest),
         Some((&30, rest)) => wrap(accounts, rest),
         Some((&31, rest)) => unwrap_burn(program_id, accounts, rest),
@@ -274,6 +288,43 @@ fn transfer(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     if to_ct.address().as_array() != tt.balance.id() { return Err(ProgramError::InvalidArgument); }
     let ctx = EncryptContext { encrypt_program: ep, config: cfg, deposit: dep, cpi_authority: cpi_auth, caller_program: caller, network_encryption_key: nk, payer: owner, event_authority: evt, system_program: sys, cpi_authority_bump: data[0] };
     ctx.transfer_graph(from_ct, to_ct, amt_ct, from_ct, to_ct)?; Ok(())
+}
+
+// ── 22: TransferWithReceipt ──
+// Same balance updates as Transfer, plus emits a binary receipt ciphertext
+// (= amount on success, 0 on insufficient balance) authorized to a caller-
+// supplied target program. Owner-signer-only — no delegate path.
+//
+// SECURITY: receipt_ct's authorized field is the target program. Whoever
+// holds compute access also holds decrypt access in encrypt's current ACL
+// model — pc-token's contract with callers is that they will not call
+// `request_decryption` on receipts. The user's signature on this tx is
+// consent for that trust relationship. (The principled fix lives in the
+// encrypt program: split authorized into compute_authorized /
+// decrypt_authorized.)
+
+fn transfer_with_receipt(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let [from_acct, to_acct, from_ct, to_ct, amt_ct, receipt_ct, target_program, ep, cfg, dep, cpi_auth, caller, nk, owner, evt, sys, ..] = accounts
+    else { return Err(ProgramError::NotEnoughAccountKeys); };
+    if !owner.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
+    if data.is_empty() { return Err(ProgramError::InvalidInstructionData); }
+    let fd = unsafe { from_acct.borrow_unchecked() };
+    let ft = TokenAccount::from_bytes(fd)?;
+    if !ft.is_initialized() { return Err(ProgramError::UninitializedAccount); }
+    assert_not_frozen(ft)?;
+    if owner.address().as_array() != &ft.owner { return Err(ProgramError::InvalidArgument); }
+    let td = unsafe { to_acct.borrow_unchecked() };
+    let tt = TokenAccount::from_bytes(td)?;
+    if !tt.is_initialized() { return Err(ProgramError::UninitializedAccount); }
+    assert_not_frozen(tt)?;
+    if ft.mint != tt.mint { return Err(ProgramError::InvalidArgument); }
+    if from_ct.address().as_array() != ft.balance.id() { return Err(ProgramError::InvalidArgument); }
+    if to_ct.address().as_array() != tt.balance.id() { return Err(ProgramError::InvalidArgument); }
+    let ctx = EncryptContext { encrypt_program: ep, config: cfg, deposit: dep, cpi_authority: cpi_auth, caller_program: caller, network_encryption_key: nk, payer: owner, event_authority: evt, system_program: sys, cpi_authority_bump: data[0] };
+    ctx.create_plaintext_typed::<Uint64>(&0u64, receipt_ct)?;
+    ctx.transfer_receipt_graph(from_ct, to_ct, amt_ct, from_ct, to_ct, receipt_ct)?;
+    ctx.transfer_ciphertext(receipt_ct, target_program)?;
+    Ok(())
 }
 
 // ── 4: Approve ──

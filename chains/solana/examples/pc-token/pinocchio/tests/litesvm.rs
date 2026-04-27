@@ -61,6 +61,20 @@ fn transfer_from_graph(
     (new_from, new_to, new_allowance)
 }
 
+#[encrypt_fn]
+fn transfer_receipt_graph(
+    from_balance: EUint64,
+    to_balance: EUint64,
+    amount: EUint64,
+) -> (EUint64, EUint64, EUint64) {
+    let s = from_balance >= amount;
+    let zero = amount - amount;
+    let actual = if s { amount } else { zero };
+    let new_from = from_balance - actual;
+    let new_to = to_balance + actual;
+    (new_from, new_to, actual)
+}
+
 const PROGRAM_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../../../target/deploy/pc_token.so"
@@ -208,6 +222,49 @@ fn transfer_ix(
             AccountMeta::new(*from_balance_ct, false),
             AccountMeta::new(*to_balance_ct, false),
             AccountMeta::new(*amount_ct, false),
+            AccountMeta::new_readonly(*encrypt_program, false),
+            AccountMeta::new(*config, false),
+            AccountMeta::new(*deposit, false),
+            AccountMeta::new_readonly(*cpi_authority, false),
+            AccountMeta::new_readonly(*program_id, false),
+            AccountMeta::new_readonly(*network_encryption_key, false),
+            AccountMeta::new(*owner, true),
+            AccountMeta::new_readonly(*event_authority, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transfer_with_receipt_ix(
+    program_id: &Pubkey,
+    from_account: &Pubkey,
+    to_account: &Pubkey,
+    from_balance_ct: &Pubkey,
+    to_balance_ct: &Pubkey,
+    amount_ct: &Pubkey,
+    receipt_ct: &Pubkey,
+    target_program: &Pubkey,
+    cpi_bump: u8,
+    encrypt_program: &Pubkey,
+    config: &Pubkey,
+    deposit: &Pubkey,
+    cpi_authority: &Pubkey,
+    network_encryption_key: &Pubkey,
+    owner: &Pubkey,
+    event_authority: &Pubkey,
+) -> Instruction {
+    Instruction::new_with_bytes(
+        *program_id,
+        &[22u8, cpi_bump],
+        vec![
+            AccountMeta::new_readonly(*from_account, false),
+            AccountMeta::new_readonly(*to_account, false),
+            AccountMeta::new(*from_balance_ct, false),
+            AccountMeta::new(*to_balance_ct, false),
+            AccountMeta::new(*amount_ct, false),
+            AccountMeta::new(*receipt_ct, true),
+            AccountMeta::new_readonly(*target_program, false),
             AccountMeta::new_readonly(*encrypt_program, false),
             AccountMeta::new(*config, false),
             AccountMeta::new(*deposit, false),
@@ -857,3 +914,125 @@ fn test_full_lifecycle() {
     assert_eq!(ctx.decrypt_from_store(&bob.balance_ct), 5_250);
     assert_eq!(ctx.decrypt_from_store(&allowance_pubkey), 250);
 }
+
+// ── TransferWithReceipt (disc 22) ──
+//
+// Same balance updates as Transfer, plus emits a binary receipt
+// (= amount on success, 0 on insufficient balance) authorized to a
+// caller-supplied target program. Powers the receipt-gated pc-swap flow.
+
+#[test]
+fn test_transfer_with_receipt_sufficient() {
+    let mut ctx = EncryptTestContext::new_default();
+    let (program_id, cpi_authority, cpi_bump) = setup(&mut ctx);
+
+    let mint = create_mint(&mut ctx, &program_id, 6, false);
+    let alice = create_account(&mut ctx, &program_id, &cpi_authority, cpi_bump, &mint.pda);
+    let bob = create_account(&mut ctx, &program_id, &cpi_authority, cpi_bump, &mint.pda);
+
+    do_mint(&mut ctx, &program_id, &cpi_authority, cpi_bump, &mint, &alice, 1000);
+
+    // Pretend a third program is the receipt target — any pubkey will do for testing.
+    let target_program = ctx.new_funded_keypair().pubkey();
+
+    let amount_ct = ctx.create_input::<Uint64>(300, &program_id);
+    let receipt_kp = Keypair::new();
+
+    let ix = transfer_with_receipt_ix(
+        &program_id,
+        &alice.pda,
+        &bob.pda,
+        &alice.balance_ct,
+        &bob.balance_ct,
+        &amount_ct,
+        &receipt_kp.pubkey(),
+        &target_program,
+        cpi_bump,
+        ctx.program_id(),
+        ctx.config_pda(),
+        ctx.deposit_pda(),
+        &cpi_authority,
+        ctx.network_encryption_key_pda(),
+        &alice.owner.pubkey(),
+        ctx.event_authority(),
+    );
+    ctx.send_transaction(&[ix], &[&alice.owner, &receipt_kp]);
+
+    let receipt_pubkey = receipt_kp.pubkey();
+    ctx.register_ciphertext(&receipt_pubkey);
+
+    // Cluster: run transfer_receipt_graph with 3 outputs (from, to, receipt).
+    let graph = transfer_receipt_graph();
+    ctx.enqueue_graph_execution(
+        &graph,
+        &[alice.balance_ct, bob.balance_ct, amount_ct],
+        &[alice.balance_ct, bob.balance_ct, receipt_pubkey],
+    );
+    ctx.process_pending();
+    ctx.register_ciphertext(&alice.balance_ct);
+    ctx.register_ciphertext(&bob.balance_ct);
+    ctx.register_ciphertext(&receipt_pubkey);
+
+    assert_eq!(ctx.decrypt_from_store(&alice.balance_ct), 700);
+    assert_eq!(ctx.decrypt_from_store(&bob.balance_ct), 300);
+    assert_eq!(ctx.decrypt_from_store(&receipt_pubkey), 300, "receipt = transferred amount");
+}
+
+#[test]
+fn test_transfer_with_receipt_insufficient_emits_zero() {
+    // Soundness invariant: when the user lies about amount_in (i.e., balance < amount),
+    // the transfer no-ops AND the receipt is exactly 0 (never partial). This is what
+    // pc-swap multiplies its reserve and payout updates by.
+    let mut ctx = EncryptTestContext::new_default();
+    let (program_id, cpi_authority, cpi_bump) = setup(&mut ctx);
+
+    let mint = create_mint(&mut ctx, &program_id, 6, false);
+    let alice = create_account(&mut ctx, &program_id, &cpi_authority, cpi_bump, &mint.pda);
+    let bob = create_account(&mut ctx, &program_id, &cpi_authority, cpi_bump, &mint.pda);
+
+    // Alice has 50 — claims 999.
+    do_mint(&mut ctx, &program_id, &cpi_authority, cpi_bump, &mint, &alice, 50);
+
+    let target_program = ctx.new_funded_keypair().pubkey();
+    let amount_ct = ctx.create_input::<Uint64>(999, &program_id);
+    let receipt_kp = Keypair::new();
+
+    let ix = transfer_with_receipt_ix(
+        &program_id,
+        &alice.pda,
+        &bob.pda,
+        &alice.balance_ct,
+        &bob.balance_ct,
+        &amount_ct,
+        &receipt_kp.pubkey(),
+        &target_program,
+        cpi_bump,
+        ctx.program_id(),
+        ctx.config_pda(),
+        ctx.deposit_pda(),
+        &cpi_authority,
+        ctx.network_encryption_key_pda(),
+        &alice.owner.pubkey(),
+        ctx.event_authority(),
+    );
+    ctx.send_transaction(&[ix], &[&alice.owner, &receipt_kp]);
+
+    let receipt_pubkey = receipt_kp.pubkey();
+    ctx.register_ciphertext(&receipt_pubkey);
+
+    let graph = transfer_receipt_graph();
+    ctx.enqueue_graph_execution(
+        &graph,
+        &[alice.balance_ct, bob.balance_ct, amount_ct],
+        &[alice.balance_ct, bob.balance_ct, receipt_pubkey],
+    );
+    ctx.process_pending();
+    ctx.register_ciphertext(&alice.balance_ct);
+    ctx.register_ciphertext(&bob.balance_ct);
+    ctx.register_ciphertext(&receipt_pubkey);
+
+    assert_eq!(ctx.decrypt_from_store(&alice.balance_ct), 50, "balance unchanged");
+    assert_eq!(ctx.decrypt_from_store(&bob.balance_ct), 0, "recipient unchanged");
+    assert_eq!(ctx.decrypt_from_store(&receipt_pubkey), 0, "receipt is 0 — no partial transfer");
+}
+

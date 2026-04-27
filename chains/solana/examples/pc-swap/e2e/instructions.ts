@@ -102,7 +102,9 @@ export function createLpPositionIx(
   });
 }
 
-/** 1: Swap. direction=0 → A→B, direction=1 → B→A. */
+/** 1: Swap. direction=0 → A→B, direction=1 → B→A.
+ *  receiptCt: fresh keypair, signs the tx — pc-swap CPIs into
+ *  pc-token::TransferWithReceipt(disc 22) which creates this account. */
 export function swapIx(
   ctx: SwapContext, pool: PublicKey,
   userInAcct: PublicKey, userOutAcct: PublicKey,
@@ -111,6 +113,7 @@ export function swapIx(
   vaultInBalCt: PublicKey, vaultOutBalCt: PublicKey,
   reserveInCt: PublicKey, reserveOutCt: PublicKey,
   amtInCt: PublicKey, minOutCt: PublicKey, amtOutCt: PublicKey,
+  receiptCt: PublicKey,
   direction: number,
 ): TransactionInstruction {
   return new TransactionInstruction({
@@ -131,12 +134,15 @@ export function swapIx(
       { pubkey: amtInCt, isSigner: false, isWritable: true },
       { pubkey: minOutCt, isSigner: false, isWritable: true },
       { pubkey: amtOutCt, isSigner: false, isWritable: true },
+      { pubkey: receiptCt, isSigner: true, isWritable: true },
       ...swapEncryptAndTokenAccounts(ctx),
     ],
   });
 }
 
-/** 2: AddLiquidity — user transfers token A and B to pool vaults via CPI, gets LP minted. */
+/** 2: AddLiquidity — two TransferWithReceipt CPIs (one per side); the
+ *  graph reads both receipts as the trusted deposit amounts.
+ *  receiptACt / receiptBCt: fresh keypairs, sign the tx. */
 export function addLiquidityIx(
   ctx: SwapContext, pool: PublicKey,
   userAAcct: PublicKey, userBAcct: PublicKey,
@@ -145,6 +151,7 @@ export function addLiquidityIx(
   vaultABalCt: PublicKey, vaultBBalCt: PublicKey,
   reserveACt: PublicKey, reserveBCt: PublicKey, totalSupplyCt: PublicKey,
   amtACt: PublicKey, amtBCt: PublicKey, userLpCt: PublicKey,
+  receiptACt: PublicKey, receiptBCt: PublicKey,
 ): TransactionInstruction {
   const [lpPda] = deriveLpPda(ctx.programId, pool, ctx.payer);
   return new TransactionInstruction({
@@ -167,6 +174,8 @@ export function addLiquidityIx(
       { pubkey: amtACt, isSigner: false, isWritable: true },
       { pubkey: amtBCt, isSigner: false, isWritable: true },
       { pubkey: userLpCt, isSigner: false, isWritable: true },
+      { pubkey: receiptACt, isSigner: true, isWritable: true },
+      { pubkey: receiptBCt, isSigner: true, isWritable: true },
       ...swapEncryptAndTokenAccounts(ctx),
     ],
   });
