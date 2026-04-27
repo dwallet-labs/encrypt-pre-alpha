@@ -1,42 +1,64 @@
 #!/usr/bin/env bun
 /**
- * PC-Swap E2E — Confidential UniV2 AMM on Solana Devnet
+ * PC-Swap E2E — Confidential AMM that composes with PC-Token via CPI.
  *
- * All reserves, swap amounts, and LP positions are encrypted.
- * There is no decrypt instruction — nobody can read any values,
- * not even the pool creator.
+ * Pool reserves are real PC-Token TokenAccounts owned by the pool PDA.
+ * Each swap / add / remove does:
+ *   1. an FHE graph (computes amounts conditionally on validity)
+ *   2. transfer_ciphertext(amount → pc-token program)
+ *   3. CPI pc-token::transfer
  *
- * Usage: bun main.ts <ENCRYPT_PROGRAM_ID> <PC_SWAP_PROGRAM_ID>
+ * Balances stay encrypted throughout; only transaction success is observable.
+ *
+ * Usage: bun main.ts <ENCRYPT_PROGRAM_ID> <PC_TOKEN_PROGRAM_ID> <PC_SWAP_PROGRAM_ID>
  */
-import { Connection, Keypair, PublicKey, TransactionInstruction } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction, sendAndConfirmTransaction } from "@solana/web3.js";
 import * as fs from "fs";
 import { type EncryptAccounts } from "../../_shared/encrypt-setup.ts";
 import { log, ok, val, sendTx, pda, pollUntil, isVerified, mockCiphertext } from "../../_shared/helpers.ts";
 import { createEncryptClient, Chain } from "../../../clients/typescript/src/grpc.ts";
-import { type SwapContext, deriveSwapPdas, derivePoolPda, createPoolIx, swapIx, addLiquidityIx, removeLiquidityIx } from "./instructions.ts";
+import {
+  type SwapContext, deriveSwapPdas, derivePoolPda, deriveLpPda,
+  createPoolIx, createLpPositionIx, swapIx, addLiquidityIx, removeLiquidityIx,
+} from "./instructions.ts";
+import {
+  type PcTokenContext, derivePcTokenPdas, deriveMintPda, deriveAccountPda, deriveVaultPda,
+  initializeMintIx, initializeAccountIx, initializeVaultIx, wrapIx,
+} from "../../pc-token/e2e/instructions.ts";
+import { createSplMint, createSplTokenAccount, splMintToIx, readSplBalance } from "../../pc-token/e2e/spl-helpers.ts";
 
 const RPC = "https://api.devnet.solana.com";
-const FHE128 = 5;
-const [eArg, sArg] = process.argv.slice(2);
-if (!eArg || !sArg) { console.error("Usage: bun main.ts <ENCRYPT_ID> <SWAP_ID>"); process.exit(1); }
-const EP = new PublicKey(eArg), SP = new PublicKey(sArg);
+const FHE64 = 4;
+const DECIMALS = 6;
+const TOKENS = (n: number) => BigInt(n) * 1_000_000n;
+
+const [eArg, tArg, sArg] = process.argv.slice(2);
+if (!eArg || !tArg || !sArg) {
+  console.error("Usage: bun main.ts <ENCRYPT_ID> <PC_TOKEN_ID> <PC_SWAP_ID>");
+  process.exit(1);
+}
+const EP = new PublicKey(eArg), TP = new PublicKey(tArg), SP = new PublicKey(sArg);
 const conn = new Connection(RPC, "confirmed");
 const payer = (() => { try { return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(
   fs.readFileSync(process.env.KEYPAIR_PATH ?? `${process.env.HOME}/.config/solana/devnet-admin.json`, "utf-8")))); } catch { return Keypair.generate(); } })();
 
-async function e(grpc: any, v: bigint, nk: Buffer): Promise<PublicKey> {
-  const { ciphertextIdentifiers } = await grpc.createInput({ chain: Chain.Solana,
-    inputs: [{ ciphertextBytes: mockCiphertext(v, FHE128), fheType: FHE128 }],
-    authorized: SP.toBytes(), networkEncryptionPublicKey: nk });
+/** Encrypt a value into a ciphertext authorized to a target program. */
+async function enc(grpc: any, v: bigint, nk: Buffer, target: PublicKey): Promise<PublicKey> {
+  const { ciphertextIdentifiers } = await grpc.createInput({
+    chain: Chain.Solana,
+    inputs: [{ ciphertextBytes: mockCiphertext(v, FHE64), fheType: FHE64 }],
+    authorized: target.toBytes(),
+    networkEncryptionPublicKey: nk,
+  });
   return new PublicKey(ciphertextIdentifiers[0]);
 }
 
 async function main() {
-  console.log("\n\x1b[1m═══ PC-Swap E2E: Fully Confidential AMM ═══\x1b[0m\n");
+  console.log("\n\x1b[1m═══ PC-Swap E2E: AMM composing with PC-Token via CPI ═══\x1b[0m\n");
   const grpc = createEncryptClient();
   ok(`Payer: ${payer.publicKey.toBase58()}, Balance: ${(await conn.getBalance(payer.publicKey))/1e9} SOL`);
 
-  // Encrypt setup
+  // ── Encrypt setup ──
   const [cfgPda] = pda([Buffer.from("encrypt_config")], EP);
   const [evtAuth] = pda([Buffer.from("__event_authority")], EP);
   const [depPda, depBump] = pda([Buffer.from("encrypt_deposit"), payer.publicKey.toBuffer()], EP);
@@ -54,98 +76,159 @@ async function main() {
       {pubkey:payer.publicKey,isSigner:true,isWritable:false},{pubkey:payer.publicKey,isSigner:true,isWritable:true},
       {pubkey:payer.publicKey,isSigner:true,isWritable:true},{pubkey:vp,isSigner:vp.equals(payer.publicKey),isWritable:true},
       {pubkey:PublicKey.default,isSigner:false,isWritable:false},{pubkey:PublicKey.default,isSigner:false,isWritable:false}]})]);
-    ok("Deposit created");
-  } else ok("Deposit exists");
-
-  const enc: EncryptAccounts = { encryptProgram:EP, configPda:cfgPda, eventAuthority:evtAuth, depositPda:depPda, networkKeyPda:nkPda, networkKey:nk };
-  const { cpiAuthority, cpiBump } = deriveSwapPdas(SP);
-  const ctx: SwapContext = { programId:SP, enc, payer:payer.publicKey, cpiAuthority, cpiBump };
-
-  // ═══ 1. Create pool + LP position ═══
-  log("1/6", "Creating pool + LP position...");
-  const mA = Keypair.generate().publicKey, mB = Keypair.generate().publicKey;
-  const [pp, pb] = derivePoolPda(SP, mA, mB);
-  const rA = Keypair.generate(), rB = Keypair.generate(), ts = Keypair.generate(), pc = Keypair.generate();
-  await sendTx(conn, payer, [createPoolIx(ctx, pp, pb, mA, mB, rA.publicKey, rB.publicKey, ts.publicKey, pc.publicKey)], [rA, rB, ts, pc]);
-  ok(`Pool: ${pp.toBase58()}`);
-
-  const [lpPda, lpBump] = pda([Buffer.from("pc_lp"), pp.toBuffer(), payer.publicKey.toBuffer()], SP);
-  const lpBal = Keypair.generate();
-  await sendTx(conn, payer, [new TransactionInstruction({ programId: SP, data: Buffer.from([5, lpBump, cpiBump]), keys: [
-    {pubkey:lpPda,isSigner:false,isWritable:true}, {pubkey:pp,isSigner:false,isWritable:false},
-    {pubkey:payer.publicKey,isSigner:false,isWritable:false}, {pubkey:lpBal.publicKey,isSigner:true,isWritable:true},
-    {pubkey:EP,isSigner:false,isWritable:false}, {pubkey:cfgPda,isSigner:false,isWritable:false},
-    {pubkey:depPda,isSigner:false,isWritable:true}, {pubkey:cpiAuthority,isSigner:false,isWritable:false},
-    {pubkey:SP,isSigner:false,isWritable:false}, {pubkey:nkPda,isSigner:false,isWritable:false},
-    {pubkey:payer.publicKey,isSigner:true,isWritable:true}, {pubkey:evtAuth,isSigner:false,isWritable:false},
-    {pubkey:PublicKey.default,isSigner:false,isWritable:false}]})], [lpBal]);
-  ok(`LP position: ${lpPda.toBase58()}`);
-
-  // ═══ 2. Add liquidity ═══
-  log("2/6", "Adding liquidity (encrypted amounts via gRPC)...");
-  const aA = await e(grpc, 10_000n, nk), aB = await e(grpc, 100n, nk);
-  await sendTx(conn, payer, [addLiquidityIx(ctx, pp, rA.publicKey, rB.publicKey, ts.publicKey, aA, aB, lpBal.publicKey)]);
-  await pollUntil(conn, rA.publicKey, isVerified, 120_000);
-  await pollUntil(conn, ts.publicKey, isVerified, 120_000);
-  ok("Liquidity added — reserves and LP balance updated (all encrypted)");
-
-  // ═══ 3. Swap A → B ═══
-  log("3/6", "Swap A → B (encrypted amount)...");
-  const s1i = await e(grpc, 1000n, nk), s1m = await e(grpc, 0n, nk), s1o = await e(grpc, 0n, nk);
-  await sendTx(conn, payer, [swapIx(ctx, pp, rA.publicKey, rB.publicKey, s1i, s1m, s1o, pc.publicKey, 0)]);
-  await pollUntil(conn, rA.publicKey, isVerified, 120_000);
-  await pollUntil(conn, pc.publicKey, isVerified, 120_000);
-
-  // Read public price via gRPC — anyone can do this, no authorization needed
-  try {
-    const { encodeReadCiphertextMessage } = await import("../../../clients/typescript/src/grpc.ts");
-    const msg = encodeReadCiphertextMessage(0, pc.publicKey.toBytes(), new Uint8Array(0), 0n);
-    const priceResult = await grpc.readCiphertext({ message: msg, signature: Buffer.alloc(64), signer: Buffer.alloc(32) });
-    const priceBuf = priceResult.value;
-    const priceVal = priceBuf.readBigUInt64LE(0);
-    val("Price (B per A, 6 dec)", `${Number(priceVal) / 1_000_000}`);
-  } catch (err: any) {
-    ok("Price ciphertext committed (gRPC read may need executor sync)");
   }
-  ok("Swap executed — reserves encrypted, price public");
+  ok("Encrypt ready");
 
-  // ═══ 4. Swap B → A ═══
-  log("4/6", "Swap B → A (encrypted amount, reverse)...");
-  const s2i = await e(grpc, 10n, nk), s2m = await e(grpc, 0n, nk), s2o = await e(grpc, 0n, nk);
-  await sendTx(conn, payer, [swapIx(ctx, pp, rB.publicKey, rA.publicKey, s2i, s2m, s2o, pc.publicKey, 1)]);
-  await pollUntil(conn, rA.publicKey, isVerified, 120_000);
-  ok("Reverse swap executed");
+  const encAccts: EncryptAccounts = { encryptProgram:EP, configPda:cfgPda, eventAuthority:evtAuth, depositPda:depPda, networkKeyPda:nkPda, networkKey:nk };
 
-  // ═══ 5. Slippage rejection ═══
-  log("5/6", "Swap with excessive slippage...");
-  const s3i = await e(grpc, 500n, nk), s3m = await e(grpc, 999n, nk), s3o = await e(grpc, 0n, nk);
-  await sendTx(conn, payer, [swapIx(ctx, pp, rA.publicKey, rB.publicKey, s3i, s3m, s3o, pc.publicKey, 0)]);
-  await pollUntil(conn, rA.publicKey, isVerified, 120_000);
-  ok("Swap submitted — slippage check enforced in FHE (no-op if failed)");
+  // pc-token + pc-swap CPI authorities
+  const tokenPdas = derivePcTokenPdas(TP, payer.publicKey);
+  const swapPdas = deriveSwapPdas(SP, TP);
+  const tokenCtx: PcTokenContext = { programId:TP, enc:encAccts, payer:payer.publicKey,
+    cpiAuthority: tokenPdas.cpiAuthority, cpiBump: tokenPdas.cpiBump };
+  const swapCtx: SwapContext = { programId:SP, pcTokenProgramId:TP, enc:encAccts, payer:payer.publicKey,
+    cpiAuthority: swapPdas.cpiAuthority, cpiBump: swapPdas.cpiBump,
+    pcTokenCpiAuthority: swapPdas.pcTokenCpiAuthority, pcTokenCpiBump: swapPdas.pcTokenCpiBump };
 
-  // ═══ 6. Remove liquidity ═══
-  log("6/6", "Removing liquidity (encrypted burn amount)...");
-  const bc = await e(grpc, 500_000n, nk), oa = await e(grpc, 0n, nk), ob = await e(grpc, 0n, nk);
-  await sendTx(conn, payer, [removeLiquidityIx(ctx, pp, rA.publicKey, rB.publicKey, ts.publicKey, bc, lpBal.publicKey, oa, ob)]);
-  await pollUntil(conn, rA.publicKey, isVerified, 120_000);
-  await pollUntil(conn, ts.publicKey, isVerified, 120_000);
-  ok("Liquidity removed — withdrawn amounts, new reserves, LP balance all encrypted");
+  // ═══ 1. Mock SPL mints + balance ═══
+  log("1/8", "Creating mock SPL mints (USD + DOGE)...");
+  const splUsd = await createSplMint(conn, payer, DECIMALS, payer.publicKey);
+  const splDoge = await createSplMint(conn, payer, DECIMALS, payer.publicKey);
+  const userUsdAta = await createSplTokenAccount(conn, payer, splUsd.publicKey, payer.publicKey);
+  const userDogeAta = await createSplTokenAccount(conn, payer, splDoge.publicKey, payer.publicKey);
+  await sendTx(conn, payer, [splMintToIx(splUsd.publicKey, userUsdAta.publicKey, payer.publicKey, TOKENS(1000))]);
+  await sendTx(conn, payer, [splMintToIx(splDoge.publicKey, userDogeAta.publicKey, payer.publicKey, TOKENS(1000))]);
+  ok(`User has 1000 USD + 1000 DOGE`);
+
+  // ═══ 2. PC-Token mints + vaults + user accounts ═══
+  log("2/8", "Creating pcUSD + pcDOGE mints, vaults, and user pc-token accounts...");
+  const usdAuth = Keypair.generate(), dogeAuth = Keypair.generate();
+  const [pcUsdMint, pcUsdMintBump] = deriveMintPda(TP, usdAuth.publicKey);
+  const [pcDogeMint, pcDogeMintBump] = deriveMintPda(TP, dogeAuth.publicKey);
+  await sendTx(conn, payer, [initializeMintIx(tokenCtx, pcUsdMint, pcUsdMintBump, DECIMALS, usdAuth.publicKey)], [usdAuth]);
+  await sendTx(conn, payer, [initializeMintIx(tokenCtx, pcDogeMint, pcDogeMintBump, DECIMALS, dogeAuth.publicKey)], [dogeAuth]);
+
+  const [usdVault, usdVaultBump] = deriveVaultPda(TP, pcUsdMint);
+  const [dogeVault, dogeVaultBump] = deriveVaultPda(TP, pcDogeMint);
+  await sendTx(conn, payer, [initializeVaultIx(tokenCtx, usdVault, usdVaultBump, pcUsdMint, splUsd.publicKey)]);
+  await sendTx(conn, payer, [initializeVaultIx(tokenCtx, dogeVault, dogeVaultBump, pcDogeMint, splDoge.publicKey)]);
+  const usdVaultAta = await createSplTokenAccount(conn, payer, splUsd.publicKey, usdVault);
+  const dogeVaultAta = await createSplTokenAccount(conn, payer, splDoge.publicKey, dogeVault);
+
+  const [userUsdPc, userUsdPcBump] = deriveAccountPda(TP, pcUsdMint, payer.publicKey);
+  const [userDogePc, userDogePcBump] = deriveAccountPda(TP, pcDogeMint, payer.publicKey);
+  const userUsdBal = Keypair.generate(), userDogeBal = Keypair.generate();
+  await sendTx(conn, payer, [initializeAccountIx(tokenCtx, userUsdPc, userUsdPcBump, pcUsdMint, payer.publicKey, userUsdBal.publicKey)], [userUsdBal]);
+  await sendTx(conn, payer, [initializeAccountIx(tokenCtx, userDogePc, userDogePcBump, pcDogeMint, payer.publicKey, userDogeBal.publicKey)], [userDogeBal]);
+  ok("PC-Token accounts ready");
+
+  // ═══ 3. Wrap SPL → pcToken ═══
+  log("3/8", "Wrapping 1000 USD + 1000 DOGE to pcTokens...");
+  const wrapUsdCt = await enc(grpc, TOKENS(1000), nk, TP);
+  const wrapDogeCt = await enc(grpc, TOKENS(1000), nk, TP);
+  await sendTx(conn, payer, [wrapIx(tokenCtx, usdVault, userUsdPc, userUsdAta.publicKey, usdVaultAta.publicKey, userUsdBal.publicKey, wrapUsdCt, payer.publicKey, TOKENS(1000))]);
+  await sendTx(conn, payer, [wrapIx(tokenCtx, dogeVault, userDogePc, userDogeAta.publicKey, dogeVaultAta.publicKey, userDogeBal.publicKey, wrapDogeCt, payer.publicKey, TOKENS(1000))]);
+  await pollUntil(conn, userUsdBal.publicKey, isVerified);
+  await pollUntil(conn, userDogeBal.publicKey, isVerified);
+  ok("Wrapped");
+
+  // ═══ 4. Create pool ═══
+  log("4/8", "Creating pool — pc-swap CPIs into pc-token::initialize_account for both vaults...");
+  const [poolPda, poolBump] = derivePoolPda(SP, pcUsdMint, pcDogeMint);
+  // Pool vaults are pc-token TokenAccounts owned by the pool PDA.
+  const [poolVaultUsd, poolVaultUsdBump] = deriveAccountPda(TP, pcUsdMint, poolPda);
+  const [poolVaultDoge, poolVaultDogeBump] = deriveAccountPda(TP, pcDogeMint, poolPda);
+  const poolVaultUsdBal = Keypair.generate(), poolVaultDogeBal = Keypair.generate();
+  const poolReserveUsd = Keypair.generate(), poolReserveDoge = Keypair.generate(), poolTotalSupply = Keypair.generate();
+
+  await sendTx(conn, payer, [createPoolIx(swapCtx, poolPda, poolBump,
+    pcUsdMint, pcDogeMint,
+    poolVaultUsd, poolVaultUsdBump, poolVaultDoge, poolVaultDogeBump,
+    poolVaultUsdBal.publicKey, poolVaultDogeBal.publicKey,
+    poolReserveUsd.publicKey, poolReserveDoge.publicKey, poolTotalSupply.publicKey,
+  )], [poolVaultUsdBal, poolVaultDogeBal, poolReserveUsd, poolReserveDoge, poolTotalSupply]);
+  ok(`Pool: ${poolPda.toBase58().slice(0, 12)}…`);
+
+  log("4/8", "Creating LP position...");
+  const userLpBal = Keypair.generate();
+  await sendTx(conn, payer, [createLpPositionIx(swapCtx, poolPda, payer.publicKey, userLpBal.publicKey)], [userLpBal]);
+  const [lpPda] = deriveLpPda(SP, poolPda, payer.publicKey);
+  ok(`LP: ${lpPda.toBase58().slice(0, 12)}…`);
+
+  // ═══ 5. AddLiquidity (500 pcUSD + 500 pcDOGE) ═══
+  log("5/8", "AddLiquidity — pc-swap CPIs pc-token::transfer twice (user → vaults)...");
+  const addUsdCt = await enc(grpc, TOKENS(500), nk, SP);
+  const addDogeCt = await enc(grpc, TOKENS(500), nk, SP);
+  await sendTx(conn, payer, [addLiquidityIx(swapCtx, poolPda,
+    userUsdPc, userDogePc, poolVaultUsd, poolVaultDoge,
+    userUsdBal.publicKey, userDogeBal.publicKey, poolVaultUsdBal.publicKey, poolVaultDogeBal.publicKey,
+    poolReserveUsd.publicKey, poolReserveDoge.publicKey, poolTotalSupply.publicKey,
+    addUsdCt, addDogeCt, userLpBal.publicKey,
+  )]);
+  await pollUntil(conn, poolReserveUsd.publicKey, isVerified);
+  await pollUntil(conn, poolReserveDoge.publicKey, isVerified);
+  await pollUntil(conn, userLpBal.publicKey, isVerified);
+  ok("Liquidity added — vault balances incremented via CPI, LP minted");
+
+  // ═══ 6. Swap (50 pcUSD → pcDOGE) ═══
+  log("6/8", "Swap 50 pcUSD → pcDOGE (CPI: pc-swap → pc-token::transfer × 2)...");
+  const swapInCt = await enc(grpc, TOKENS(50), nk, SP);
+  const swapMinCt = await enc(grpc, 0n, nk, SP);
+  const swapOutCt = await enc(grpc, 0n, nk, SP);
+  await sendTx(conn, payer, [swapIx(swapCtx, poolPda,
+    userUsdPc, userDogePc, poolVaultUsd, poolVaultDoge,
+    userUsdBal.publicKey, userDogeBal.publicKey, poolVaultUsdBal.publicKey, poolVaultDogeBal.publicKey,
+    poolReserveUsd.publicKey, poolReserveDoge.publicKey,
+    swapInCt, swapMinCt, swapOutCt, 0,
+  )]);
+  await pollUntil(conn, poolReserveUsd.publicKey, isVerified);
+  await pollUntil(conn, poolReserveDoge.publicKey, isVerified);
+  ok("Swap executed — user paid pcUSD to vault, received pcDOGE from vault");
+
+  // ═══ 7. Swap with slippage rejection ═══
+  log("7/8", "Swap with high min_out — should no-op (slippage check in FHE)...");
+  const swapIn2 = await enc(grpc, TOKENS(10), nk, SP);
+  const swapMin2 = await enc(grpc, TOKENS(999), nk, SP); // unattainable
+  const swapOut2 = await enc(grpc, 0n, nk, SP);
+  await sendTx(conn, payer, [swapIx(swapCtx, poolPda,
+    userUsdPc, userDogePc, poolVaultUsd, poolVaultDoge,
+    userUsdBal.publicKey, userDogeBal.publicKey, poolVaultUsdBal.publicKey, poolVaultDogeBal.publicKey,
+    poolReserveUsd.publicKey, poolReserveDoge.publicKey,
+    swapIn2, swapMin2, swapOut2, 0,
+  )]);
+  ok("Slippage no-op submitted (FHE conditional zeroes both transfer amounts)");
+
+  // ═══ 8. RemoveLiquidity ═══
+  log("8/8", "RemoveLiquidity — pc-swap CPIs pc-token::transfer twice (vaults → user) signed by pool PDA...");
+  // Burn ~250 LP units (we minted 500 on first deposit since lp = amount_a)
+  const burnCt = await enc(grpc, TOKENS(250), nk, SP);
+  const outA = await enc(grpc, 0n, nk, SP);
+  const outB = await enc(grpc, 0n, nk, SP);
+  await sendTx(conn, payer, [removeLiquidityIx(swapCtx, poolPda,
+    userUsdPc, userDogePc, poolVaultUsd, poolVaultDoge,
+    userUsdBal.publicKey, userDogeBal.publicKey, poolVaultUsdBal.publicKey, poolVaultDogeBal.publicKey,
+    poolReserveUsd.publicKey, poolReserveDoge.publicKey, poolTotalSupply.publicKey,
+    burnCt, userLpBal.publicKey, outA, outB,
+  )]);
+  await pollUntil(conn, poolReserveUsd.publicKey, isVerified);
+  await pollUntil(conn, poolReserveDoge.publicKey, isVerified);
+  await pollUntil(conn, userLpBal.publicKey, isVerified);
+  ok("Liquidity removed — vault balances decremented, user receives pc-tokens, LP burned");
 
   console.log("\n\x1b[1m═══ Result ═══\x1b[0m\n");
-  console.log("  6 operations executed on Solana devnet:");
-  console.log("    1. Pool created with encrypted zero reserves");
-  console.log("    2. Liquidity added (amounts encrypted)");
-  console.log("    3. Swap A → B (amount in, amount out, reserves — all encrypted)");
-  console.log("    4. Swap B → A (reverse, all encrypted)");
-  console.log("    5. Slippage-protected swap (enforced in FHE)");
-  console.log("    6. LP tokens burned, proportional reserves withdrawn (all encrypted)");
-  console.log("\n  There is no decrypt instruction. Nobody can read:");
-  console.log("    - Pool reserves (TVL hidden)");
-  console.log("    - Swap amounts (trade sizes hidden)");
-  console.log("    - LP positions (ownership hidden)");
-  console.log("    - Withdrawn amounts (exits hidden)");
-  console.log("\n  What's visible: 6 transactions happened. Nothing else.");
-  console.log(`\n  \x1b[32m✓ Fully confidential AMM on Solana.\x1b[0m\n`);
+  console.log("  pc-swap composes with pc-token via Cross-Program Invocation:");
+  console.log("    • Pool vaults are real pc-token TokenAccounts (owned by pool PDA)");
+  console.log("    • create_pool        → CPI pc-token::initialize_account × 2");
+  console.log("    • add_liquidity      → CPI pc-token::transfer × 2 (user → vaults)");
+  console.log("    • swap               → CPI pc-token::transfer × 2 (one each direction)");
+  console.log("    • remove_liquidity   → CPI pc-token::transfer × 2 (vaults → user, signed by pool PDA)");
+  console.log("");
+  console.log("  Each amount ciphertext is moved to pc-token's program with");
+  console.log("  transfer_ciphertext (move semantics — the original loses access)");
+  console.log("  before the CPI, so the encrypt program accepts pc-token as the");
+  console.log("  authorized party for the underlying transfer_graph.");
+  console.log("");
+  console.log("  All balances stayed encrypted throughout. \x1b[32m✓\x1b[0m\n");
 
   grpc.close();
 }
