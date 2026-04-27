@@ -57,7 +57,7 @@ fn transfer_graph(
 
 If the sender has insufficient funds, both balances remain unchanged — a privacy-preserving silent no-op. The chain cannot distinguish success from failure.
 
-### Delegated Transfer (composability)
+### Delegated Transfer (allowance composability)
 
 ```rust
 #[encrypt_fn]
@@ -77,6 +77,35 @@ fn transfer_from_graph(
 ```
 
 Both balance AND allowance are checked atomically in the encrypted domain.
+
+### Transfer with Receipt (receipt-gated composability)
+
+Same balance arithmetic as `transfer_graph`, plus a third output that is a *binary* receipt — exactly `amount` on a successful transfer, exactly `0` on insufficient balance, never a partial value. Downstream programs multiply their state updates by the receipt to gate them in lockstep with the actual transfer:
+
+```rust
+#[encrypt_fn]
+fn transfer_receipt_graph(
+    from_balance: EUint64, to_balance: EUint64, amount: EUint64,
+) -> (EUint64, EUint64, EUint64) {
+    let sufficient = from_balance >= amount;
+    let zero = amount - amount;
+    let actual = if sufficient { amount } else { zero };
+    let new_from = from_balance - actual;
+    let new_to   = to_balance   + actual;
+    (new_from, new_to, actual)
+}
+```
+
+The `TransferWithReceipt` handler:
+
+1. Authorizes the transfer (owner-signer only — there is no delegated variant).
+2. Calls `create_plaintext_typed::<Uint64>(0, receipt_ct)` to allocate the receipt account at a caller-supplied keypair, initially authorized to `pc-token`.
+3. Runs `transfer_receipt_graph` with the three balance ciphertexts plus the receipt as outputs.
+4. Calls `transfer_ciphertext(receipt_ct, target_program)` to move the receipt's ACL to whatever program the caller asked for.
+
+After the instruction returns, the receipt sits Pending on-chain with its digest still being committed by the executor's normal event processing. By the time a downstream graph in the same transaction reads it, the digest has been written.
+
+The **receipt invariant** (`actual ∈ {amount, 0}`, never partial) is what makes downstream gating work cleanly: a program that multiplies its state updates by the receipt either advances by the full intended amount or doesn't advance at all — there's no partial-credit edge case to write FHE branches for.
 
 ## Wrap / Unwrap
 

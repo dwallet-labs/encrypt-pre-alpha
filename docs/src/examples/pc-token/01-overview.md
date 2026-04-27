@@ -29,21 +29,22 @@ Public Domain (SPL Token)         Confidential Domain (PC-Token)
 
 ## Instructions
 
-| Disc | Instruction       | Description                                      |
-| ---- | ----------------- | ------------------------------------------------ |
-| 0    | InitializeMint    | Create a new token mint                          |
-| 1    | InitializeAccount | Create token account with encrypted zero balance |
-| 3    | Transfer          | Encrypted owner transfer                         |
-| 4    | Approve           | Approve delegate with encrypted allowance        |
-| 5    | Revoke            | Revoke delegation                                |
-| 10   | FreezeAccount     | Freeze authority freezes account                 |
-| 11   | ThawAccount       | Freeze authority thaws account                   |
-| 20   | TransferFrom      | Delegated transfer (composability entry point)   |
-| 23   | InitializeVault   | Create vault linking PC-Token mint to SPL mint   |
-| 30   | Wrap              | Deposit SPL → mint pcTokens (vault-backed)       |
-| 31   | UnwrapBurn        | Burn pcTokens, create withdrawal receipt         |
-| 32   | UnwrapDecrypt     | Decrypt burned amount                            |
-| 33   | UnwrapComplete    | Verify + release SPL, close receipt              |
+| Disc | Instruction          | Description                                                  |
+| ---- | -------------------- | ------------------------------------------------------------ |
+| 0    | InitializeMint       | Create a new token mint                                      |
+| 1    | InitializeAccount    | Create token account with encrypted zero balance             |
+| 3    | Transfer             | Encrypted owner transfer                                     |
+| 4    | Approve              | Approve delegate with encrypted allowance                    |
+| 5    | Revoke               | Revoke delegation                                            |
+| 10   | FreezeAccount        | Freeze authority freezes account                             |
+| 11   | ThawAccount          | Freeze authority thaws account                               |
+| 20   | TransferFrom         | Delegated transfer (allowance-based composability)           |
+| 22   | TransferWithReceipt  | Owner-signed transfer that emits a binary receipt ciphertext |
+| 23   | InitializeVault      | Create vault linking PC-Token mint to SPL mint               |
+| 30   | Wrap                 | Deposit SPL → mint pcTokens (vault-backed)                   |
+| 31   | UnwrapBurn           | Burn pcTokens, create withdrawal receipt                     |
+| 32   | UnwrapDecrypt        | Decrypt burned amount                                        |
+| 33   | UnwrapComplete       | Verify + release SPL, close receipt                          |
 
 ## Vault-Backed Only
 
@@ -51,14 +52,33 @@ There is no standalone `MintTo` or `Burn`. Tokens can only enter through `Wrap` 
 
 ## Composability
 
-Other programs CPI into PC-Token via `Approve` + `TransferFrom`. The delegate (another program's PDA) can move tokens on behalf of the user, with encrypted allowance enforcement:
+PC-Token offers two composition patterns. Pick the one that matches the trust the calling program needs.
 
-```rust
-// DeFi program (e.g., AMM, lending, dark pool)
-fn execute_trade(accounts) {
-    // CPI into PC-Token — move pcUSDC from user to pool
-    pc_token::transfer_from(user_account, pool_account, amount_ct, delegate_pda);
-}
+### Allowance-based (`Approve` + `TransferFrom`)
+
+The user `Approve`s a delegate program with an encrypted allowance, then the delegate calls `TransferFrom` to move tokens. The delegate never sees plaintext — the allowance and amount are checked in FHE atomically. Suitable for flows where the calling program's only role is *authorized delivery* and it never needs proof that the transfer actually happened (e.g. a streaming-payments program that never reads downstream state).
+
+### Receipt-based (`TransferWithReceipt`)
+
+The owner CPIs (or directly calls) `TransferWithReceipt`, supplying a fresh receipt-ciphertext keypair and a `target_program` (typically the calling program's ID). The same FHE graph that updates `from.balance` and `to.balance` also outputs a *binary* receipt ciphertext:
+
+```
+receipt = amount    if from_balance >= amount
+receipt = 0         otherwise
 ```
 
-The DeFi program never sees plaintext amounts. It just passes encrypted ciphertexts through CPI.
+`TransferWithReceipt` then transfers the receipt's ACL to `target_program`, so the caller can read it in its own FHE graphs. This gives a downstream program a faithful, encrypted, *gated* signal of the deposit — never a partial value, never the from-balance — without any plaintext crossing the boundary. It is the pattern PC-Swap uses to keep its reserves consistent with what users actually deposited (see [PC-Swap: Overview](../pc-swap/01-overview.md)).
+
+```rust
+// In the calling program (e.g. PC-Swap):
+//   1. Make sure amount_ct is authorized to pc-token
+ctx.transfer_ciphertext(amount_ct, pc_token_program)?;
+//   2. CPI TransferWithReceipt — emits receipt_ct, ACL goes to caller
+cpi_pc_token_transfer_with_receipt(receipt_ct, target = caller_program_id)?;
+//   3. Use receipt_ct in the calling program's own graphs (gates state updates)
+ctx.my_graph(reserve_in, reserve_out, receipt_ct, ...)?;
+//   4. Reclaim the receipt's rent
+ctx.close_ciphertext(receipt_ct, payer)?;
+```
+
+The receipt is **owner-signed only** — there is no delegated variant. The receipt's `authorized` ACL is the calling program, so the receipt can also be decrypted by that program if it explicitly requests decryption; in practice composable programs never call `request_decryption` on intermediate ciphertexts and the audit trail of the source code is the assurance that they don't.

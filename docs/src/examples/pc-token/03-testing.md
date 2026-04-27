@@ -2,7 +2,7 @@
 
 > **Pre-Alpha Disclaimer:** This is an early pre-alpha release for exploring the SDK and starting development only. There is no real encryption — all data is completely public and stored as plaintext on-chain. Do not submit any sensitive or real data. Encryption keys and the trust model are not final; do not rely on any encryption guarantees or key material until mainnet. All interfaces, APIs, and data formats are subject to change without notice. The Solana program and all on-chain data will be wiped periodically and everything will be deleted when we transition to Encrypt Alpha 1. This software is provided "as is" without warranty of any kind; use is entirely at your own risk and dWallet Labs assumes no liability for any damages arising from its use.
 
-## Unit Tests (10)
+## Unit Tests
 
 FHE graph logic tested via mock compute engine:
 
@@ -10,10 +10,11 @@ FHE graph logic tested via mock compute engine:
 - `transfer_ok` / `transfer_insufficient` — conditional transfer
 - `burn_ok` / `burn_insufficient` — conditional burn
 - `transfer_from_ok` / `transfer_from_insufficient` — delegated with allowance check
+- `transfer_receipt_ok` / `transfer_receipt_insufficient` — receipt is `amount` on success, exactly `0` on insufficient balance
 - `unwrap_burn_sufficient` / `unwrap_burn_insufficient` — burn with receipt output
 - `graph_shapes` — verify input/output counts
 
-## LiteSVM Integration Tests (9)
+## LiteSVM Integration Tests
 
 Full on-chain lifecycle with Encrypt CPI:
 
@@ -22,6 +23,7 @@ Full on-chain lifecycle with Encrypt CPI:
 - `test_mint_to` — set balance via harness, verify encrypted value
 - `test_transfer` / `test_transfer_insufficient_funds` — encrypted transfer
 - `test_approve_and_transfer_from` — delegation + delegated transfer
+- `test_transfer_with_receipt_sufficient` / `test_transfer_with_receipt_insufficient_emits_zero` — `TransferWithReceipt` end-to-end, asserts the receipt's plaintext value matches the binary invariant
 - `test_freeze_blocks_transfer` — freeze/thaw cycle
 - `test_full_lifecycle` — mint → transfer → freeze → thaw → approve → transfer_from
 

@@ -4,63 +4,67 @@
 
 ## What It Is
 
-PC-Swap is a confidential UniV2 AMM built on Encrypt FHE. All reserves, swap amounts, and LP positions are encrypted. The only public value is the **price** — a public ciphertext readable by anyone via gRPC. Everything else is hidden.
+PC-Swap is a confidential UniV2-style AMM built on Encrypt FHE. Reserves, swap amounts, and LP positions are all encrypted, and the pool's vaults are real PC-Token TokenAccounts owned by the pool PDA — so deposits and payouts compose with the rest of the confidential token domain through Encrypt CPI rather than through any plaintext bridge.
 
 ## What's Confidential
 
-| Data | Visibility |
-|------|-----------|
-| Pool reserves (TVL) | **Encrypted** — nobody can see |
-| Swap amounts (trade sizes) | **Encrypted** — nobody can see |
-| LP positions | **Encrypted** — nobody can see |
-| Withdrawn amounts | **Encrypted** — nobody can see |
-| Price (B per A) | **Public** — readable via gRPC |
-| Transaction activity | **Visible** — that swaps happened, not what |
+| Data                       | Visibility                                  |
+| -------------------------- | ------------------------------------------- |
+| Pool reserves (TVL)        | **Encrypted**                               |
+| Swap amounts (trade sizes) | **Encrypted**                               |
+| LP positions               | **Encrypted**                               |
+| Withdrawn amounts          | **Encrypted**                               |
+| Transaction activity       | **Visible** — that swaps happened, not what |
 
 ## Composability with PC-Token
 
-PC-Swap demonstrates Encrypt's composability — it operates on encrypted ciphertexts through Encrypt CPI without seeing any plaintext:
+The pool keeps its own encrypted reserve mirrors (`reserve_a`, `reserve_b`, `total_supply`) inside the `Pool` account, and a pair of vault PC-Token accounts (`vault_a`, `vault_b`) owned by the pool PDA holds the actual encrypted balances of the two underlying tokens.
+
+Every flow goes through PC-Token's `TransferWithReceipt` (disc 22, see [PC-Token: Composability](../pc-token/01-overview.md#receipt-based-transferwithreceipt)). The receipt that comes out is binary — `amount` on a successful deposit, `0` on insufficient balance — and PC-Swap multiplies its mirror updates and payouts by it. That single design choice keeps the pool sound under any user-supplied `amount_in`:
 
 ```
 User
   │
-  ├── Approve PC-Swap as delegate on pcUSDC account (PC-Token)
+  ├── (no Approve needed — the user signs the swap tx as owner of the pcUSDC TA)
   │
-  ├── Swap pcUSDC → pcSOL (PC-Swap)
-  │   ├── CPI → Encrypt: swap_graph (FHE math on encrypted reserves)
-  │   └── CPI → PC-Token: transfer_from (move encrypted tokens)
-  │
-  └── Read price off-chain (gRPC readCiphertext — zero cost)
+  └── Swap pcUSDC → pcSOL  (PC-Swap)
+       ├── CPI → PC-Token: TransferWithReceipt   (user pcUSDC → pool vault A,
+       │                                          emits receipt_ct authorized
+       │                                          to PC-Swap)
+       ├── CPI → Encrypt:   swap_graph           (FHE math — every output gated
+       │                                          on receipt_ct, never on the
+       │                                          user's amount_in claim)
+       ├── CPI → PC-Token: Transfer              (vault B → user pcSOL,
+       │                                          signed by pool PDA)
+       └── CPI → Encrypt:   close_ciphertext     (reclaim receipt rent)
 ```
 
-## Constant Product Formula
+`add_liquidity` is the same idea with two `TransferWithReceipt` calls (one per side) feeding `add_liquidity_graph`. `remove_liquidity` doesn't need a receipt — it gates on the user's encrypted `LpPosition.balance`, which is PC-Swap-internal and already trusted.
 
-The swap graph computes UniV2's `x * y = k` entirely in the encrypted domain:
+## Constant-Product Math, Receipt-Gated
+
+The swap graph computes UniV2's `x · y = k` entirely in the encrypted domain, treating the **receipt** as the authoritative input — not the user's claim:
 
 ```rust
-amount_out = (amount_in * 997 * reserve_out) / (reserve_in * 1000 + amount_in * 997)
+amount_in_with_fee = receipt * 997
+amount_out         = (amount_in_with_fee * reserve_out)
+                   / (reserve_in * 1000 + amount_in_with_fee)
 ```
 
-- 0.3% fee baked as constants (997/1000)
-- K-invariant enforced: `new_k >= old_k`
-- Slippage protection: `amount_out >= min_amount_out`
-- If either check fails → silent no-op (reserves unchanged)
+- 0.3% fee baked in via the 997/1000 constants.
+- Slippage protection: `amount_out >= min_amount_out`.
+- If slippage fails → `final_in` and `final_out` collapse to 0 (no-op).
+- If the user lied about `amount_in` (claimed more than they have) → `receipt = 0` from PC-Token → `final_in`, `final_out`, and both reserve deltas are all 0. The pool stays consistent, the user gets nothing.
 
 ## LP Token Enforcement
 
-LP shares are per-user encrypted balances in `LpPosition` accounts. The FHE graphs atomically update reserves, total supply, AND the user's LP balance:
+LP shares are per-user encrypted balances in `LpPosition` accounts (PC-Swap-internal — not real PC-Token mints). The graphs atomically update reserves, total supply, and the user's LP balance:
 
-- **AddLiquidity**: computes proportional LP tokens, adds to user's balance
-- **RemoveLiquidity**: checks `user_lp >= burn_amount` in FHE — if insufficient, entire operation is a no-op
+- **AddLiquidity** — first deposit: `lp = receipt_a`. Subsequent: proportional to `min(receipt_a · supply / reserve_a, receipt_b · supply / reserve_b)`. Both arms gated on the receipts.
+- **RemoveLiquidity** — checks `user_lp >= burn_amount` in FHE. If insufficient, the entire operation is a no-op — reserves, supply, and LP balance unchanged.
 
-Nobody can drain more LP than they own. The ownership check happens inside the encrypted computation.
+Nobody can drain more LP than they own, and the ownership check happens inside the encrypted computation.
 
-## Public Price Oracle
+## Soundness Note
 
-The pool has a `price_ct` ciphertext made public via `make_public` during pool creation. After each swap, the graph outputs the new price. Anyone reads it via gRPC `readCiphertext` — zero on-chain cost.
-
-For quotes: `expected_out ≈ amount_in × price / 1_000_000`. Client-side math, no on-chain transaction.
-
-### Privacy Trade-off
-
-The price leaks the reserve *ratio*, not the absolute values. A 10% price move could be a $100 trade on a $1,000 pool or a $1M trade on a $10M pool — observers can't tell. For maximum privacy (hidden price), remove the public price ciphertext and use blind swaps with slippage protection.
+The receipt's ACL after `TransferWithReceipt` is PC-Swap. That means an audited PC-Swap binary that never calls `request_decryption` cannot leak the receipt's value — and the receipt's only value is one bit ("user was solvent for `amount_in`"). The user's signature on the swap transaction is consent for this. The principled long-term fix — splitting Encrypt's `authorized` into separate `compute_authorized` / `decrypt_authorized` ACLs so a program can read a ciphertext without being able to decrypt it — lives in the Encrypt program itself; until then, audited program source is the trust anchor.
