@@ -181,6 +181,65 @@ fn extract(data: EUint32Vector, index: EUint32Vector) -> EUint32Vector {
 }
 ```
 
+### Rotate Entries
+
+Cyclically rotate vector elements left by an encrypted scalar amount. The shift count is a scalar of the matching scalar type (e.g. `EUint32` for `EUint32Vector`):
+
+```rust
+use encrypt_types::encrypted::{EUint32Vector, EUint32};
+
+#[encrypt_fn]
+fn rotate(data: EUint32Vector, n: EUint32) -> EUint32Vector {
+    data.rotate_entries(&n)  // result[i] = data[(i + n) mod len]
+}
+```
+
+The rotation wraps within the vector's element count, so positions that fall outside the populated prefix wrap back to the zero region.
+
+## Reductions
+
+Reductions collapse a vector down to a single scalar. The output ciphertext must be allocated with the **scalar** type, not the vector type — the graph carries the result-type re-tagging from vector to scalar.
+
+### Sum / Min / Max
+
+Numeric reductions over the entire vector:
+
+```rust
+use encrypt_types::encrypted::{EUint32Vector, EUint32};
+
+#[encrypt_fn] fn sum(v: EUint32Vector) -> EUint32 { v.reduce_add() }
+#[encrypt_fn] fn smallest(v: EUint32Vector) -> EUint32 { v.reduce_min() }
+#[encrypt_fn] fn largest(v: EUint32Vector) -> EUint32 { v.reduce_max() }
+```
+
+Reductions span **every entry of the vector**, not just the populated prefix. For `reduce_min`, unset slots are zero — so unless every slot is filled, the minimum is always 0. Pad the vector with the appropriate sentinel (typically the maximum value of the element type) for non-prefix workloads.
+
+### Boolean Reductions
+
+`reduce_any` / `reduce_all` operate on `EUint8Vector` (treating each element as a boolean: 0 = false, nonzero = true) and return `EBool`:
+
+```rust
+use encrypt_types::encrypted::{EUint8Vector, EBool};
+
+#[encrypt_fn] fn any_set(v: EUint8Vector) -> EBool { v.reduce_any() }
+#[encrypt_fn] fn all_set(v: EUint8Vector) -> EBool { v.reduce_all() }
+```
+
+`reduce_any` returns `1` if any element is nonzero, `0` otherwise. `reduce_all` returns `1` if every element is nonzero, `0` otherwise. Both inspect the full element count of the input vector — same padding caveat as above for `reduce_all`.
+
+### Composing Reductions
+
+Reductions chain naturally with scalar arithmetic inside the same graph:
+
+```rust
+#[encrypt_fn]
+fn range(v: EUint32Vector) -> EUint32 {
+    let mx = v.reduce_max();
+    let mn = v.reduce_min();
+    mx - mn
+}
+```
+
 ## Chained Operations
 
 Multiple operations compose naturally in a single graph:
@@ -289,6 +348,5 @@ The 32-byte digest commits to the full 8,192-byte value. The actual encrypted da
 ## Limitations
 
 - **No on-chain plaintext creation**: `create_plaintext_ciphertext` can't handle 8,192 bytes in instruction data. Use gRPC `CreateInput` instead.
-- **No cross-type extraction**: You can't extract a scalar `EUint32` from an `EUint32Vector` in a single graph (use `get` which returns a vector with the value at position 0).
-- **No reductions**: There are no `sum`, `min_reduce`, or `max_reduce` operations yet that collapse a vector to a scalar. These are on the roadmap.
 - **Index range**: For `EVectorU8`, indices are `u8` values (max 255) but the vector has 8,192 elements — only the first 256 are addressable by gather/scatter/assign.
+- **Reductions span the full element count**: `reduce_min` / `reduce_all` see unset slots (zero) as participating values; pad the vector if you only want to reduce over a populated prefix.
