@@ -112,16 +112,19 @@ fn minimum_balance(s: usize) -> u64 {
 
 // ── FHE Graphs ──
 
-/// Constant-product swap with 0.3% fee + slippage check.
+/// Constant-product swap with 0.3% fee + slippage check + refund.
 ///
 /// `receipt` is pc-token's TransferWithReceipt output: it equals `amount_in`
 /// on a successful user→vault deposit, exactly `0` on insufficient balance.
 /// All reserve and payout updates are functions of `receipt`, never of the
 /// user-supplied `amount_in` directly — so a lying user produces `receipt=0`
-/// and every output is 0/no-op uniformly. `amount_in_ct` itself is passed
-/// to pc-token (not pc-swap), so swap_graph cannot read it — `min_amount_out`
-/// (always pc-swap-authorized) provides the typed zero source. On slippage
-/// failure both `final_in` and `final_out` collapse to 0.
+/// and every output is 0/no-op uniformly.
+///
+/// `refund = receipt - final_in` is `0` on a successful swap and `receipt`
+/// on slippage rejection. The dispatch CPIs `pc-token::transfer(vault→user)`
+/// for `refund` after the graph, so a slipped deposit is returned to the
+/// user instead of being stranded in the pool vault. `min_amount_out`
+/// (always pc-swap-authorized) provides the typed zero source.
 #[encrypt_fn]
 fn swap_graph(
     reserve_in: EUint64,
@@ -137,19 +140,22 @@ fn swap_graph(
     let zero = min_amount_out - min_amount_out;
     let final_in = if slip_ok { receipt } else { zero };
     let final_out = if slip_ok { amount_out } else { zero };
+    let refund = receipt - final_in;
     let new_reserve_in = reserve_in + final_in;
     let new_reserve_out = reserve_out - final_out;
-    (final_in, final_out, new_reserve_in, new_reserve_out)
+    (refund, final_out, new_reserve_in, new_reserve_out)
 }
 
-/// Add liquidity — updates reserves, total supply, and user LP balance.
+/// Add liquidity — atomic-deposit gated, with per-side refunds.
 ///
 /// `receipt_a` / `receipt_b` are pc-token TransferWithReceipt outputs from
 /// the two user→vault deposits (= amount on success, 0 on insufficient).
-/// Reserves and LP updates are functions of the receipts only; if either
-/// deposit no-ops the reserves and LP supply stay consistent.
+/// Reserves, supply, and LP only update when BOTH receipts are non-zero
+/// AND the resulting `lp_to_mint` is positive (`settled = both_ok && lp_ok`).
+/// On any other case nothing settles and `refund_a` / `refund_b` carry the
+/// untouched receipts back to the user via vault→user CPIs in the dispatch.
 ///
-/// First deposit: lp = receipt_a. Subsequent: proportional.
+/// First deposit: lp = receipt_a. Subsequent: proportional via min(lp_a, lp_b).
 #[encrypt_fn]
 fn add_liquidity_graph(
     reserve_a: EUint64,
@@ -159,8 +165,6 @@ fn add_liquidity_graph(
     receipt_b: EUint64,
     user_lp: EUint64,
 ) -> (EUint64, EUint64, EUint64, EUint64, EUint64, EUint64) {
-    let new_reserve_a = reserve_a + receipt_a;
-    let new_reserve_b = reserve_b + receipt_b;
     let initial_lp = receipt_a;
     let lp_from_a = (receipt_a * total_supply) / (reserve_a + 1);
     let lp_from_b = (receipt_b * total_supply) / (reserve_b + 1);
@@ -170,16 +174,32 @@ fn add_liquidity_graph(
         lp_from_a
     };
     let is_subsequent = total_supply >= 1;
-    let lp_to_mint = if is_subsequent {
+    let lp_to_mint_proposed = if is_subsequent {
         subsequent_lp
     } else {
         initial_lp
     };
+
+    // Atomic-deposit gate: settle only when both sides deposited AND minted.
+    let pa_ok = receipt_a >= 1;
+    let pb_ok = receipt_b >= 1;
+    let both_ok = if pa_ok { pb_ok } else { pa_ok };
+    let lp_ok = lp_to_mint_proposed >= 1;
+    let settled = if both_ok { lp_ok } else { both_ok };
+
+    let zero = total_supply - total_supply;
+    let final_a = if settled { receipt_a } else { zero };
+    let final_b = if settled { receipt_b } else { zero };
+    let lp_to_mint = if settled { lp_to_mint_proposed } else { zero };
+    let refund_a = receipt_a - final_a;
+    let refund_b = receipt_b - final_b;
+    let new_reserve_a = reserve_a + final_a;
+    let new_reserve_b = reserve_b + final_b;
     let new_total_supply = total_supply + lp_to_mint;
     let new_user_lp = user_lp + lp_to_mint;
     (
-        receipt_a,
-        receipt_b,
+        refund_a,
+        refund_b,
         new_reserve_a,
         new_reserve_b,
         new_total_supply,
@@ -368,6 +388,55 @@ fn cpi_pc_token_transfer<'a>(
         Some(seeds) => invoke_signed(&ix, views, &[Signer::from(seeds)]),
         None => invoke_signed(&ix, views, &[]),
     }
+}
+
+/// Build the metas/views and CPI a single pc-token::transfer in one call.
+/// Lives in its own function so the metas+views arrays (~600B) get their
+/// own stack frame instead of accumulating in the caller — keeps the
+/// dispatch handlers under Solana's 4 KB frame limit.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn pool_signed_transfer<'a>(
+    from_acct: &'a AccountView,
+    to_acct: &'a AccountView,
+    from_bal_ct: &'a AccountView,
+    to_bal_ct: &'a AccountView,
+    amt_ct: &'a AccountView,
+    ep: &'a AccountView,
+    cfg: &'a AccountView,
+    dep: &'a AccountView,
+    pc_token_cpi_auth: &'a AccountView,
+    pc_token_program: &'a AccountView,
+    nk: &'a AccountView,
+    pool_acct: &'a AccountView,
+    evt: &'a AccountView,
+    sys: &'a AccountView,
+    token_cpi_bump: u8,
+    pool_seeds: &[Seed],
+) -> ProgramResult {
+    let (metas, views) = pc_token_transfer_accounts(
+        from_acct,
+        to_acct,
+        from_bal_ct,
+        to_bal_ct,
+        amt_ct,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        pool_acct,
+        evt,
+        sys,
+    );
+    cpi_pc_token_transfer(
+        pc_token_program,
+        token_cpi_bump,
+        &metas,
+        &views,
+        Some(pool_seeds),
+    )
 }
 
 /// Build pc-token::TransferWithReceipt account list.
@@ -987,14 +1056,15 @@ fn swap(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     );
     cpi_pc_token_transfer_with_receipt(pc_token_program, token_cpi_bump, &metas, &views)?;
 
-    // 2) Run swap math against the receipt. final_in and final_out are 0 if
+    // 2) Run swap math against the receipt. min_out_ct slot becomes `refund`
+    //    (= 0 on success, = receipt on slippage rejection). final_out is 0 if
     //    the deposit no-op'd or slippage failed; reserves move in lockstep.
     ctx.swap_graph(
         reserve_in_ct,
         reserve_out_ct,
         receipt_ct,
         min_out_ct,
-        min_out_ct,     // out 0: final_in (overwrites min_out_ct, used only for tracing)
+        min_out_ct,     // out 0: refund (re-tags min_out_ct, paid back below)
         amt_out_ct,     // out 1: final_out
         reserve_in_ct,  // out 2: new_reserve_in
         reserve_out_ct, // out 3: new_reserve_out
@@ -1033,7 +1103,32 @@ fn swap(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
         Some(&pool_seeds),
     )?;
 
-    // 4) Reclaim receipt rent. close_ciphertext signs as pc-swap's CPI auth and
+    // 4) Refund: vault_in → user. min_out_ct now holds the refund amount
+    //    (= 0 on a successful swap, = receipt when slippage rejected the swap).
+    //    Pays back the deposit so a slipped swap doesn't strand pc-tokens
+    //    in the pool's vault. Authorized to pc-swap currently — re-tag to
+    //    pc-token so the transfer CPI's input auth check passes.
+    ctx.transfer_ciphertext(min_out_ct, pc_token_program)?;
+    pool_signed_transfer(
+        vault_in_acct,
+        user_in_acct,
+        vault_in_bal_ct,
+        user_in_bal_ct,
+        min_out_ct,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        pool_acct,
+        evt,
+        sys,
+        token_cpi_bump,
+        &pool_seeds,
+    )?;
+
+    // 5) Reclaim receipt rent. close_ciphertext signs as pc-swap's CPI auth and
     //    requires receipt.authorized == pc-swap, which holds (set by step 1).
     ctx.close_ciphertext(receipt_ct, payer)?;
     Ok(())
@@ -1196,8 +1291,9 @@ fn add_liquidity(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     );
     cpi_pc_token_transfer_with_receipt(pc_token_program, token_cpi_bump, &metas, &views)?;
 
-    // 3) Run liquidity math against the receipts. Reserves, supply, and LP all
-    //    update from receipts only — lying inputs collapse to 0 uniformly.
+    // 3) Run liquidity math against the receipts. Reserves, supply, and LP
+    //    only update when both deposits settled; otherwise refund_a / refund_b
+    //    carry the truthful side back unchanged.
     ctx.add_liquidity_graph(
         ra_ct,
         rb_ct,
@@ -1205,15 +1301,62 @@ fn add_liquidity(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
         receipt_a_ct,
         receipt_b_ct,
         user_lp_ct,
-        amt_a_ct,   // out 0: final_a (overwrites amt_a_ct, for tracing)
-        amt_b_ct,   // out 1: final_b
+        amt_a_ct,   // out 0: refund_a (re-tags amt_a_ct)
+        amt_b_ct,   // out 1: refund_b (re-tags amt_b_ct)
         ra_ct,      // out 2: new_reserve_a
         rb_ct,      // out 3: new_reserve_b
         ts_ct,      // out 4: new_total_supply
         user_lp_ct, // out 5: new_user_lp
     )?;
 
-    // 4) Reclaim receipt rent.
+    // 4) Refunds: vault → user for each side (= 0 on a fully-settled deposit,
+    //    = receipt when the deposit didn't settle). amt_*_ct are already
+    //    pc-token-authorized from steps 1 / 2, so no transfer_ciphertext needed.
+    let bb = [pool.bump];
+    let pool_seeds = [
+        Seed::from(b"pc_pool" as &[u8]),
+        Seed::from(pool.mint_a.as_ref()),
+        Seed::from(pool.mint_b.as_ref()),
+        Seed::from(&bb),
+    ];
+    pool_signed_transfer(
+        vault_a_acct,
+        user_a_acct,
+        vault_a_bal_ct,
+        user_a_bal_ct,
+        amt_a_ct,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        pool_acct,
+        evt,
+        sys,
+        token_cpi_bump,
+        &pool_seeds,
+    )?;
+    pool_signed_transfer(
+        vault_b_acct,
+        user_b_acct,
+        vault_b_bal_ct,
+        user_b_bal_ct,
+        amt_b_ct,
+        ep,
+        cfg,
+        dep,
+        pc_token_cpi_auth,
+        pc_token_program,
+        nk,
+        pool_acct,
+        evt,
+        sys,
+        token_cpi_bump,
+        &pool_seeds,
+    )?;
+
+    // 5) Reclaim receipt rent.
     ctx.close_ciphertext(receipt_a_ct, payer)?;
     ctx.close_ciphertext(receipt_b_ct, payer)?;
     Ok(())
@@ -1455,8 +1598,8 @@ mod tests {
     fn swap_basic() {
         // reserve_in, reserve_out, receipt, min_out
         let r = run_mock(swap_graph, &[1000, 2000, 100, 0], &[T, T, T, T]);
-        // r = (final_in, final_out, new_reserve_in, new_reserve_out)
-        assert_eq!(r[0], 100, "final_in == receipt on success");
+        // r = (refund, final_out, new_reserve_in, new_reserve_out)
+        assert_eq!(r[0], 0, "refund == 0 on success");
         assert!(r[1] > 0, "final_out > 0");
         assert_eq!(r[2], 1100);
         assert!(r[2] * r[3] >= 1000 * 2000);
@@ -1464,17 +1607,17 @@ mod tests {
     #[test]
     fn swap_slippage() {
         let r = run_mock(swap_graph, &[1000, 2000, 100, 999], &[T, T, T, T]);
-        assert_eq!(r[0], 0);
-        assert_eq!(r[1], 0);
-        assert_eq!(r[2], 1000);
-        assert_eq!(r[3], 2000);
+        assert_eq!(r[0], 100, "refund == receipt on slippage rejection");
+        assert_eq!(r[1], 0, "final_out collapses to 0");
+        assert_eq!(r[2], 1000, "reserve_in untouched");
+        assert_eq!(r[3], 2000, "reserve_out untouched");
     }
     #[test]
     fn swap_lying_user_receipt_zero() {
         // user claims amount_in=100 but transfer no-op'd → receipt=0.
-        // Reserves must stay 1000/2000, payout must be 0.
+        // Reserves must stay 1000/2000, payout must be 0, refund must be 0.
         let r = run_mock(swap_graph, &[1000, 2000, 0, 0], &[T, T, T, T]);
-        assert_eq!(r[0], 0, "final_in collapses with receipt=0");
+        assert_eq!(r[0], 0, "refund == 0 (nothing was deposited)");
         assert_eq!(r[1], 0, "final_out collapses with receipt=0");
         assert_eq!(r[2], 1000, "reserve_in untouched");
         assert_eq!(r[3], 2000, "reserve_out untouched");
@@ -1488,9 +1631,9 @@ mod tests {
             &[0, 0, 0, 1000, 2000, 0],
             &[T, T, T, T, T, T],
         );
-        // r = (final_a, final_b, new_reserve_a, new_reserve_b, new_total_supply, new_user_lp)
-        assert_eq!(r[0], 1000);
-        assert_eq!(r[1], 2000);
+        // r = (refund_a, refund_b, new_reserve_a, new_reserve_b, new_total_supply, new_user_lp)
+        assert_eq!(r[0], 0, "refund_a == 0 on settled deposit");
+        assert_eq!(r[1], 0, "refund_b == 0 on settled deposit");
         assert_eq!(r[2], 1000);
         assert_eq!(r[3], 2000);
         assert_eq!(r[4], 1000, "supply = receipt_a on first deposit");
@@ -1504,8 +1647,8 @@ mod tests {
             &[1000, 2000, supply, 500, 1000, 0],
             &[T, T, T, T, T, T],
         );
-        assert_eq!(r[0], 500);
-        assert_eq!(r[1], 1000);
+        assert_eq!(r[0], 0, "refund_a == 0");
+        assert_eq!(r[1], 0, "refund_b == 0");
         assert_eq!(r[2], 1500);
         assert_eq!(r[3], 3000);
         assert!(r[4] > supply);
@@ -1514,18 +1657,36 @@ mod tests {
     #[test]
     fn add_liq_lying_a_receipt_zero() {
         // user lied about token A: receipt_a=0, receipt_b=1000.
-        // Reserves should advance only for B, LP should be 0 (lp_from_a=0 dominates min).
+        // Atomic-deposit gate: settled=false → reserves untouched, supply
+        // unchanged, full B-side receipt refunded.
         let supply = 1000u128;
         let r = run_mock(
             add_liquidity_graph,
             &[1000, 2000, supply, 0, 1000, 0],
             &[T, T, T, T, T, T],
         );
-        assert_eq!(r[0], 0);
-        assert_eq!(r[1], 1000);
-        assert_eq!(r[2], 1000);
-        assert_eq!(r[3], 3000);
-        assert_eq!(r[4], supply, "supply unchanged when lp_to_mint=0");
+        assert_eq!(r[0], 0, "refund_a == 0 (nothing deposited)");
+        assert_eq!(r[1], 1000, "refund_b == receipt_b (truthful side returned)");
+        assert_eq!(r[2], 1000, "reserve_a untouched");
+        assert_eq!(r[3], 2000, "reserve_b untouched (no donation)");
+        assert_eq!(r[4], supply, "supply unchanged");
+        assert_eq!(r[5], 0);
+    }
+    #[test]
+    fn add_liq_lying_b_receipt_zero() {
+        // user lied about token B: receipt_a=1000, receipt_b=0.
+        // Symmetric to lying-A — A side gets refunded, no donation.
+        let supply = 1000u128;
+        let r = run_mock(
+            add_liquidity_graph,
+            &[1000, 2000, supply, 1000, 0, 0],
+            &[T, T, T, T, T, T],
+        );
+        assert_eq!(r[0], 1000, "refund_a == receipt_a (truthful side returned)");
+        assert_eq!(r[1], 0, "refund_b == 0");
+        assert_eq!(r[2], 1000, "reserve_a untouched");
+        assert_eq!(r[3], 2000, "reserve_b untouched");
+        assert_eq!(r[4], supply);
         assert_eq!(r[5], 0);
     }
 
