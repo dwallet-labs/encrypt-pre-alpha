@@ -25,6 +25,7 @@
   "devDependencies": {
     "@protobuf-ts/plugin": "^2.11.1",
     "@types/bun": "latest",
+    "@types/node": "^25.6.0",
     "ts-proto": "^2.11.6"
   },
   "peerDependencies": {

@@ -41,7 +41,7 @@ export interface CreateInputParams {
 }
 
 export interface CreateInputResult {
-  ciphertextIdentifiers: Buffer[];
+  ciphertextIdentifiers: Uint8Array[];
 }
 
 // ── ReadCiphertext ──
