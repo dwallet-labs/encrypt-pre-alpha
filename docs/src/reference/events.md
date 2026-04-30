@@ -3,7 +3,9 @@
 > **Pre-Alpha Disclaimer:** This is an early pre-alpha release for exploring the SDK and starting development only. There is no real encryption — all data is completely public and stored as plaintext on-chain. Do not submit any sensitive or real data. Encryption keys and the trust model are not final; do not rely on any encryption guarantees or key material until mainnet. All interfaces, APIs, and data formats are subject to change without notice. The Solana program and all on-chain data will be wiped periodically and everything will be deleted when we transition to Encrypt Alpha 1. This software is provided "as is" without warranty of any kind; use is entirely at your own risk and dWallet Labs assumes no liability for any damages arising from its use.
 
 
-The Encrypt program emits 5 event types via Anchor-compatible self-CPI. Each event is prefixed with `EVENT_IX_TAG_LE` (8 bytes, `0xe4a545ea51cb9a1d` in LE) followed by a 1-byte event discriminator.
+The Encrypt program emits 5 event types via Anchor-compatible self-CPI. Each event is prefixed with `EVENT_IX_TAG_LE` followed by a 1-byte event discriminator.
+
+`EVENT_IX_TAG_LE` is `(0x1d9acb512ea545e4u64).to_le_bytes()`, i.e. the wire bytes `e4 45 a5 2e 51 cb 9a 1d`. Anchor's `emit_cpi!` overlaps the first byte of this tag (`0xe4` = 228) with the program's instruction discriminator for `EmitEvent`, so there is no separate dispatch byte ahead of the tag — `data[0..8]` is the full tag, `data[8]` is the event discriminator.
 
 ## Event Discriminators
 
