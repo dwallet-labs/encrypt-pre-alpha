@@ -11,7 +11,7 @@
     "./grpc-web": "./src/grpc-web.ts"
   },
   "scripts": {
-    "generate": "protoc --plugin=./node_modules/.bin/protoc-gen-ts --ts_out=src/generated/grpc-web --proto_path=../../../../proto ../../../../proto/encrypt_service.proto && protoc --plugin=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=src/generated/grpc --ts_proto_opt=outputServices=grpc-js,esModuleInterop=true --proto_path=../../../../proto ../../../../proto/encrypt_service.proto",
+    "generate": "mkdir -p src/generated/grpc-web src/generated/grpc && protoc --plugin=./node_modules/.bin/protoc-gen-ts --ts_out=src/generated/grpc-web --proto_path=../../../../proto ../../../../proto/encrypt_service.proto && protoc --plugin=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=src/generated/grpc --ts_proto_opt=outputServices=grpc-js,esModuleInterop=true --proto_path=../../../../proto ../../../../proto/encrypt_service.proto",
     "build": "bunx --bun tsc",
     "clean": "rm -rf dist"
   },
