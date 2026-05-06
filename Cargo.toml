@@ -104,16 +104,20 @@ proc-macro2 = "^1"
 # ── Testing ──
 mollusk-svm = { version = "^0.11", features = ["inner-instructions"] }
 litesvm = "0.11"
-solana-program-test = { version = "4.0.0-beta.3", features = ["agave-unstable-api"] }
+# `=` (exact) on the Agave 4.0 pre-release crates — caret semver on `4.0.0-beta.X`
+# matches `4.0.0-rc.X` too (rc > beta lexically), and rc.0 switched `wincode`
+# from 0.4 to 0.5, which breaks `SchemaWrite<WincodeConfig>` for any tree that
+# also pulls a beta-track Agave crate. Pin until the family lands on a final 4.0.
+solana-program-test = { version = "=4.0.0-beta.5", features = ["agave-unstable-api"] }
 tokio = { version = "^1.50", features = ["full"] }
 trybuild = "^1"
 
 # ── Solana SDK ──
 solana-sdk = "4"
-solana-rpc-client = "4.0.0-beta.3"
-solana-rpc-client-api = "4.0.0-beta.3"
+solana-rpc-client = "=4.0.0-beta.5"
+solana-rpc-client-api = "=4.0.0-beta.5"
 solana-commitment-config = "3"
-solana-transaction-status-client-types = "4.0.0-beta.3"
+solana-transaction-status-client-types = "=4.0.0-beta.5"
 solana-transaction = "3"
 bincode = "1"
 
