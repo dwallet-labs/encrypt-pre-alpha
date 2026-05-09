@@ -78,11 +78,12 @@ The plaintext never leaves the browser. `encryptValue()` is client-side mock enc
 import { createEncryptWebClient, encryptValue, Chain } from "@encrypt.xyz/pre-alpha-solana-client/grpc-web";
 
 const grpcClient = createEncryptWebClient("https://pre-alpha-dev-1.encrypt.ika-network.net:443");
+const FHE_BOOL = 0 // Check 'crates/encrypt-types/src/types.rs' for other ciphertext variable values.
 
 const voteVal = voteYes ? 1 : 0;
 const ids = await grpcClient.createInput({
   chain: Chain.SOLANA,
-  inputs: [{ ciphertextBytes: encryptValue(voteVal), fheType: FHE_BOOL }],
+  inputs: [{ ciphertextBytes: encryptValue(voteVal, FHE_BOOL), fheType: FHE_BOOL }],
   authorized: VOTING_PROGRAM.toBytes(),
   networkEncryptionPublicKey: networkKey,
 });
