@@ -38,10 +38,11 @@ This compiles into an FHE computation graph that operates on encrypted balances.
 
 Encrypt works with all three major Solana program frameworks:
 
-| Framework | SDK Crate | Best For |
-|-----------|-----------|----------|
-| **Pinocchio** | `encrypt-pinocchio` | Maximum CU efficiency, `#![no_std]` programs |
-| **Anchor** | `encrypt-anchor` | Rapid development, declarative accounts |
-| **Native** | `encrypt-native` | `solana-program` users, no framework lock-in |
+| Framework     | SDK Crate           | Best For                                      |
+| ------------- | ------------------- | --------------------------------------------- |
+| **Pinocchio** | `encrypt-pinocchio` | Maximum CU efficiency, `#![no_std]` programs  |
+| **Anchor**    | `encrypt-anchor`    | Rapid development, declarative accounts       |
+| **Native**    | `encrypt-native`    | `solana-program` users, no framework lock-in  |
+| **Quasar**    | `encrypt-quasar`    | Declarative validation, maximum CU efficiency |
 
 All three use the same `#[encrypt_fn]` DSL and the same `EncryptCpi` trait.
